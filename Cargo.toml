@@ -1,0 +1,22 @@
+[package]
+name = "ntex-ratelimiter"
+version = "0.1.0"
+edition = "2021"
+authors = ["lollipopkit <a@lpkt.cn>"]
+description = "A rate limiter middleware for ntex web framework."
+license = "MIT"
+repository = "https://github.com/lollipopkit/ntex-ratelimiter"
+readme = "README.md"
+keywords = ["ntex", "rate limiter", "middleware"]
+categories = ["web-programming", "network-programming"]
+
+[features]
+default = ["tokio"]
+tokio = ["dep:tokio"]
+async-std = ["dep:async-std"]
+
+[dependencies]
+dashmap = "^6"
+ntex = "^2"
+tokio = { version = "1", features = ["sync", "time", "rt"], optional = true }
+async-std = { version = "1", features = ["attributes"], optional = true }
