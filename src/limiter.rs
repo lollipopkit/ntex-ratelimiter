@@ -1,6 +1,6 @@
 use dashmap::DashMap;
-use ntex::http::header::HeaderName;
-use ntex::{http::header::HeaderValue, http::StatusCode, Middleware, ServiceCtx};
+use ntex::http::header::{HeaderName, HeaderValue};
+use ntex::{http::StatusCode, Middleware, ServiceCtx};
 use std::sync::Arc;
 
 use ntex::{web, Service};
@@ -83,7 +83,7 @@ impl RateLimiter {
             capacity,
             window,
             last_cleanup: Mutex::new(Instant::now()),
-            cleanup_interval: Duration::from_secs(60), // Clean up every minute
+            cleanup_interval: Duration::from_secs(60),
         });
 
         // Start periodic cleanup if a runtime is enabled
@@ -236,9 +236,11 @@ impl web::error::WebResponseError for RateLimitErr {
 {{
     "code": 5,
     "msg": "Rate limit",
-    "remaining": {},
-    "reset": {},
-    "limit": {}
+    "data": {{
+        "remaining": {},
+        "reset": {},
+        "limit": {}
+    }}
 }}"#,
             self.remaining, self.reset, self.limit
         );

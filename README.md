@@ -2,15 +2,6 @@
 
 A flexible rate limiting middleware for the [ntex](https://github.com/ntex-rs/ntex) web framework.
 
-## Features
-
-- 🚀 High-performance, thread-safe rate limiting
-- 🪣 Token bucket algorithm for precise rate control
-- 🔄 Automatic cleanup of expired rate limiters
-- 🧩 Simple integration with ntex applications
-- ⚙️ Runtime support for both tokio and async-std via feature flags
-- 📊 Rate limit headers included in responses
-- ✅ Well-tested and production-ready
 
 ## Installation
 
@@ -21,7 +12,7 @@ Add this to your `Cargo.toml`:
 ntex-ratelimiter = "0.1.0"
 ```
 
-With async runtime features:
+With async runtime features (default is `tokio`):
 
 ```toml
 [dependencies]
@@ -45,7 +36,7 @@ async fn main() -> std::io::Result<()> {
     HttpServer::new(move || {
         App::new()
             // Apply rate limiting middleware
-            .wrap(RateLimit { limiter: Arc::clone(&limiter) })
+            .wrap(RateLimit { limiter })
             .service(web::resource("/").to(|| async { "Hello world!" }))
     })
     .bind("127.0.0.1:8080")?
@@ -76,31 +67,17 @@ When rate limits are exceeded, a `429 Too Many Requests` status code is returned
 {
     "code": 5,
     "msg": "Rate limit",
-    "remaining": 0,
-    "reset": 1621234567,
-    "limit": 100
+    "data": {
+        "remaining": 0,
+        "reset": 1700000000,
+        "limit": 100
+    }
 }
 ```
 
 - `remaining`: Always 0 when limit is exceeded
 - `reset`: Unix timestamp when the rate limit will reset
 - `limit`: The configured request limit
-
-## Advanced Usage
-
-### Custom Rate Limiter Configuration
-
-```rust
-use ntex_ratelimiter::{RateLimit, RateLimiter};
-use std::sync::Arc;
-use std::time::Duration;
-
-// Create a custom rate limiter with 200 requests per 30 seconds
-let limiter = RateLimiter::new(200, 30);
-
-// Use the rate limiter in your middleware
-let rate_limit = RateLimit { limiter: Arc::clone(&limiter) };
-```
 
 ## License
 `MIT lollipopkit`
