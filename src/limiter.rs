@@ -18,6 +18,9 @@ use async_std::task;
 
 use crate::util::unix_secs;
 
+const HEADER_RATELIMIT_REMAINING: &str = "lk-ratelimit-remaining";
+const HEADER_RATELIMIT_LIMIT: &str = "lk-ratelimit-limit";
+
 // Token bucket algorithm for rate limiting
 struct TokenBucket {
     tokens: f64,
@@ -142,7 +145,7 @@ impl RateLimiter {
         let now = unix_secs();
         self.map.retain(|_, bucket| {
             bucket.refill(now);
-            bucket.tokens_remaining() < self.capacity as u32
+            now - bucket.last_refill < self.window * 2
         });
     }
 }
@@ -180,9 +183,19 @@ where
         req: web::WebRequest<Err>,
         ctx: ServiceCtx<'_, Self>,
     ) -> Result<Self::Response, Self::Error> {
-        let ip = match req.connection_info().remote() {
-            Some(ip) => ip.to_string(),
-            None => return Err(web::error::ErrorBadRequest("Invalid IP").into()),
+        let ip = match req.headers().get("x-forwarded-for").map(|forwarded| {
+            if let Ok(forwarded_str) = forwarded.to_str() {
+                if let Some(ip) = forwarded_str.split(',').next() {
+                    return Some(ip.trim().to_string());
+                }
+            }
+            // Fallback to the remote address if x-forwarded-for is not present
+            req.connection_info().remote().map(|s| s.to_string())
+        }).flatten() {
+            Some(ip) => ip,
+            None => {
+                return Err(web::error::ErrorBadRequest("Invalid IP").into())
+            }
         };
 
         let (allowed, remaining, reset) = self.limiter.check_rate_limit(&ip);
@@ -199,11 +212,11 @@ where
 
             // Add rate limit headers to successful responses
             if let Ok(header_value) = HeaderValue::from_str(&remaining.to_string()) {
-                let header_name = HeaderName::from_static("lk-ratelimit-remaining");
+                let header_name = HeaderName::from_static(HEADER_RATELIMIT_REMAINING);
                 res.headers_mut().insert(header_name, header_value);
             }
             if let Ok(header_value) = HeaderValue::from_str(&self.limiter.capacity.to_string()) {
-                let header_name = HeaderName::from_static("lk-ratelimit-limit");
+                let header_name = HeaderName::from_static(HEADER_RATELIMIT_LIMIT);
                 res.headers_mut().insert(header_name, header_value);
             }
 
@@ -247,6 +260,8 @@ impl web::error::WebResponseError for RateLimitErr {
 
         web::HttpResponse::build(StatusCode::TOO_MANY_REQUESTS)
             .set_header("content-type", "application/json")
+            .set_header(HEADER_RATELIMIT_REMAINING, self.remaining.to_string())
+            .set_header(HEADER_RATELIMIT_LIMIT, self.limit.to_string())
             .body(body)
     }
 }
@@ -278,5 +293,20 @@ mod test {
         let (allowed, remaining, _) = limiter.check_rate_limit(ip);
         assert!(allowed);
         assert!(remaining > 0);
+    }
+
+    #[test]
+    fn test_token_bucket_refill() {
+        let mut bucket = TokenBucket::new(10, 60);
+        let now = unix_secs();
+
+        // 消耗所有token
+        for _ in 0..10 {
+            assert!(bucket.consume(1, now));
+        }
+        assert!(!bucket.consume(1, now));
+
+        // 等待一秒后应该有新的token
+        assert!(bucket.consume(1, now + 60));
     }
 }

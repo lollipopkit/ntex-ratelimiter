@@ -2,7 +2,6 @@
 
 A flexible rate limiting middleware for the [ntex](https://github.com/ntex-rs/ntex) web framework.
 
-
 ## Installation
 
 Add this to your `Cargo.toml`:
@@ -80,4 +79,5 @@ When rate limits are exceeded, a `429 Too Many Requests` status code is returned
 - `limit`: The configured request limit
 
 ## License
+
 `MIT lollipopkit`
