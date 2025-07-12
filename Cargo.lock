@@ -757,11 +757,13 @@ dependencies = [
 
 [[package]]
 name = "ntex-ratelimiter"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-std",
  "dashmap",
  "ntex",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 
