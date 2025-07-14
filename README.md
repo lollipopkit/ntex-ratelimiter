@@ -4,7 +4,7 @@
 [![Documentation](https://docs.rs/ntex-ratelimiter/badge.svg)](https://docs.rs/ntex-ratelimiter)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-A high-performance rate limiting middleware for the [ntex](https://github.com/ntex-rs/ntex) web framework.
+A rate limiting middleware for the [ntex](https://github.com/ntex-rs/ntex) web framework.
 
 ## Installation
 
@@ -12,7 +12,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-ntex-ratelimiter = "0.1.1"
+ntex-ratelimiter = "^0"
 ```
 
 ### Feature Flags
@@ -24,13 +24,13 @@ ntex-ratelimiter = "0.1.1"
 ```toml
 [dependencies]
 # Default features (tokio + json)
-ntex-ratelimiter = "0.1.1"
+ntex-ratelimiter = "^0"
 
 # With async-std instead of tokio
-ntex-ratelimiter = { version = "0.1.1", default-features = false, features = ["async-std", "json"] }
+ntex-ratelimiter = { version = "^0", default-features = false, features = ["async-std", "json"] }
 
 # Minimal build without JSON support
-ntex-ratelimiter = { version = "0.1.1", default-features = false, features = ["tokio"] }
+ntex-ratelimiter = { version = "^0", default-features = false, features = ["tokio"] }
 ```
 
 ## Quick Start
@@ -204,19 +204,6 @@ async fn main() -> std::io::Result<()> {
     .await
 }
 ```
-
-## Testing
-
-Run the test suite:
-
-```bash
-cargo test
-cargo test --features async-std --no-default-features
-```
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## License
 
