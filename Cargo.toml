@@ -1,6 +1,6 @@
 [package]
 name = "ntex-ratelimiter"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 authors = ["lollipopkit <a@lpkt.cn>"]
 description = "A rate limiter middleware for ntex web framework."
