@@ -1,25 +1,21 @@
 use dashmap::DashMap;
 use ntex::http::header::{HeaderName, HeaderValue};
 use ntex::{http::StatusCode, Middleware, ServiceCtx};
+use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use ntex::{web, Service};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-#[cfg(feature = "tokio")]
-use tokio::sync::Mutex;
 #[cfg(feature = "tokio")]
 use tokio::time::interval;
 
-#[cfg(feature = "async-std")]
-use async_std::sync::Mutex;
 #[cfg(feature = "async-std")]
 use async_std::task;
 
 #[cfg(feature = "json")]
 use serde::{Deserialize, Serialize};
-
-use crate::util::unix_secs;
 
 const HEADER_RATELIMIT_REMAINING: &str = "x-ratelimit-remaining";
 const HEADER_RATELIMIT_LIMIT: &str = "x-ratelimit-limit";
@@ -29,23 +25,19 @@ const HEADER_RATELIMIT_RESET: &str = "x-ratelimit-reset";
 #[derive(Debug)]
 struct TokenBucket {
     tokens: f64,
-    last_refill: u64,
-    capacity: usize,
-    refill_rate: f64, // tokens per second
+    last_refill: Instant,
 }
 
 impl TokenBucket {
-    fn new(capacity: usize, window: u64) -> Self {
+    fn new(capacity: usize, _window: u64) -> Self {
         Self {
             tokens: capacity as f64,
-            last_refill: unix_secs(),
-            capacity,
-            refill_rate: capacity as f64 / window as f64,
+            last_refill: Instant::now(),
         }
     }
 
-    fn consume(&mut self, tokens: usize, now: u64) -> bool {
-        self.refill(now);
+    fn consume(&mut self, tokens: usize, now: Instant, config: &RateLimiterConfig) -> bool {
+        self.refill(now, config);
         if self.tokens >= tokens as f64 {
             self.tokens -= tokens as f64;
             true
@@ -54,10 +46,11 @@ impl TokenBucket {
         }
     }
 
-    fn refill(&mut self, now: u64) {
-        let elapsed = now.saturating_sub(self.last_refill) as f64;
-        let new_tokens = elapsed * self.refill_rate;
-        self.tokens = (self.tokens + new_tokens).min(self.capacity as f64);
+    fn refill(&mut self, now: Instant, config: &RateLimiterConfig) {
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        let refill_rate = config.capacity as f64 / config.window as f64;
+        let new_tokens = elapsed * refill_rate;
+        self.tokens = (self.tokens + new_tokens).min(config.capacity as f64);
         self.last_refill = now;
     }
 
@@ -65,19 +58,29 @@ impl TokenBucket {
         self.tokens.floor() as u32
     }
 
-    fn reset_time(&self) -> u64 {
-        if self.tokens >= self.capacity as f64 {
-            unix_secs()
+    fn reset_time(&self, _now: Instant, config: &RateLimiterConfig) -> u64 {
+        if self.tokens >= config.capacity as f64 {
+            // Already at capacity, reset time is now
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
         } else {
-            let missing_tokens = self.capacity as f64 - self.tokens;
-            let seconds_to_refill = missing_tokens / self.refill_rate;
-            self.last_refill + seconds_to_refill.ceil() as u64
+            let missing_tokens = config.capacity as f64 - self.tokens;
+            let refill_rate = config.capacity as f64 / config.window as f64;
+            let seconds_to_refill = missing_tokens / refill_rate;
+            // Calculate Unix timestamp when bucket will be reset
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                + seconds_to_refill.ceil() as u64
         }
     }
 
     /// Check if this bucket is stale (hasn't been used recently)
-    fn is_stale(&self, now: u64, stale_threshold: u64) -> bool {
-        now.saturating_sub(self.last_refill) > stale_threshold
+    fn is_stale(&self, now: Instant, stale_threshold: Duration) -> bool {
+        now.duration_since(self.last_refill) > stale_threshold
     }
 }
 
@@ -87,7 +90,7 @@ pub struct RateLimiterConfig {
     pub capacity: usize,
     pub window: u64,
     pub cleanup_interval: Duration,
-    pub stale_threshold: u64,
+    pub stale_threshold: Duration,
 }
 
 impl Default for RateLimiterConfig {
@@ -96,16 +99,16 @@ impl Default for RateLimiterConfig {
             capacity: 100,
             window: 60,
             cleanup_interval: Duration::from_secs(300), // 5 minutes
-            stale_threshold: 3600, // 1 hour
+            stale_threshold: Duration::from_secs(3600), // 1 hour
         }
     }
 }
 
 /// High-performance rate limiter using token bucket algorithm
 pub struct RateLimiter {
-    map: DashMap<String, TokenBucket>,
+    map: DashMap<IpAddr, TokenBucket>,
     config: RateLimiterConfig,
-    last_cleanup: Mutex<Instant>,
+    last_cleanup: AtomicU64,
 }
 
 impl RateLimiter {
@@ -124,7 +127,12 @@ impl RateLimiter {
         let limiter = Arc::new(RateLimiter {
             map: DashMap::new(),
             config,
-            last_cleanup: Mutex::new(Instant::now()),
+            last_cleanup: AtomicU64::new(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            ),
         });
 
         // Start periodic cleanup if a runtime is enabled
@@ -157,16 +165,16 @@ impl RateLimiter {
     }
 
     /// Check rate limit for a given identifier (usually IP address)
-    pub fn check_rate_limit(&self, identifier: &str) -> RateLimitResult {
-        let now = unix_secs();
+    pub fn check_rate_limit(&self, identifier: IpAddr) -> RateLimitResult {
+        let now = Instant::now();
         let mut bucket = self
             .map
-            .entry(identifier.to_string())
+            .entry(identifier)
             .or_insert_with(|| TokenBucket::new(self.config.capacity, self.config.window));
 
-        let allowed = bucket.consume(1, now);
+        let allowed = bucket.consume(1, now, &self.config);
         let remaining = bucket.remaining_tokens();
-        let reset = bucket.reset_time();
+        let reset = bucket.reset_time(now, &self.config);
 
         RateLimitResult {
             allowed,
@@ -178,21 +186,41 @@ impl RateLimiter {
 
     /// Clean up stale entries
     async fn cleanup(&self) {
-        let mut last_cleanup = self.last_cleanup.lock().await;
-        if last_cleanup.elapsed() < self.config.cleanup_interval {
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let last_cleanup = self.last_cleanup.load(Ordering::Acquire);
+
+        // Check if enough time has passed since last cleanup
+        if now_secs.saturating_sub(last_cleanup) < self.config.cleanup_interval.as_secs() {
             return;
         }
-        *last_cleanup = Instant::now();
 
-        let now = unix_secs();
+        // Try to update the last cleanup time atomically
+        if self
+            .last_cleanup
+            .compare_exchange(last_cleanup, now_secs, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            // Another thread is doing cleanup, skip this one
+            return;
+        }
+
+        let now = Instant::now();
         let stale_threshold = self.config.stale_threshold;
-        
+
         let initial_size = self.map.len();
-        self.map.retain(|_, bucket| !bucket.is_stale(now, stale_threshold));
+        self.map
+            .retain(|_, bucket| !bucket.is_stale(now, stale_threshold));
         let final_size = self.map.len();
-        
+
         if cfg!(debug_assertions) && initial_size > final_size {
-            eprintln!("Cleaned {} stale rate limit entries", initial_size - final_size);
+            eprintln!(
+                "Cleaned {} stale rate limit entries",
+                initial_size - final_size
+            );
         }
     }
 
@@ -265,7 +293,7 @@ where
     ) -> Result<Self::Response, Self::Error> {
         let ip = extract_client_ip(&req);
 
-        let result = self.limiter.check_rate_limit(&ip);
+        let result = self.limiter.check_rate_limit(ip);
 
         if !result.allowed {
             return Err(RateLimitError::from(result).into());
@@ -281,14 +309,14 @@ where
 }
 
 /// Extract client IP from request, considering proxy headers
-fn extract_client_ip<Err>(req: &web::WebRequest<Err>) -> String {
+fn extract_client_ip<Err>(req: &web::WebRequest<Err>) -> IpAddr {
     // Check X-Forwarded-For header first
     if let Some(forwarded) = req.headers().get("x-forwarded-for") {
         if let Ok(forwarded_str) = forwarded.to_str() {
             if let Some(ip) = forwarded_str.split(',').next() {
                 let ip = ip.trim();
-                if !ip.is_empty() {
-                    return ip.to_string();
+                if let Ok(parsed_ip) = ip.parse::<IpAddr>() {
+                    return parsed_ip;
                 }
             }
         }
@@ -298,26 +326,27 @@ fn extract_client_ip<Err>(req: &web::WebRequest<Err>) -> String {
     if let Some(real_ip) = req.headers().get("x-real-ip") {
         if let Ok(ip_str) = real_ip.to_str() {
             let ip = ip_str.trim();
-            if !ip.is_empty() {
-                return ip.to_string();
+            if let Ok(parsed_ip) = ip.parse::<IpAddr>() {
+                return parsed_ip;
             }
         }
     }
 
-    // Fallback to connection info
-    req.connection_info()
-        .remote()
-        .unwrap_or("unknown")
-        .to_string()
+    // Fallback to connection info - parse SocketAddr to get IP only
+    if let Some(addr_str) = req.connection_info().remote() {
+        if let Ok(sock_addr) = addr_str.parse::<std::net::SocketAddr>() {
+            return sock_addr.ip();
+        }
+    }
+
+    // Default to localhost if all else fails
+    IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1))
 }
 
 /// Add rate limit headers to response
 fn add_rate_limit_headers(headers: &mut ntex::http::HeaderMap, result: &RateLimitResult) {
     if let Ok(value) = HeaderValue::from_str(&result.remaining.to_string()) {
-        headers.insert(
-            HeaderName::from_static(HEADER_RATELIMIT_REMAINING),
-            value,
-        );
+        headers.insert(HeaderName::from_static(HEADER_RATELIMIT_REMAINING), value);
     }
     if let Ok(value) = HeaderValue::from_str(&result.limit.to_string()) {
         headers.insert(HeaderName::from_static(HEADER_RATELIMIT_LIMIT), value);
@@ -408,50 +437,61 @@ mod tests {
 
     #[test]
     fn test_token_bucket_basic() {
+        let config = RateLimiterConfig {
+            capacity: 5,
+            window: 10,
+            ..Default::default()
+        };
         let mut bucket = TokenBucket::new(5, 10);
-        let now = unix_secs();
+        let now = Instant::now();
 
         // Should allow up to capacity
         for _ in 0..5 {
-            assert!(bucket.consume(1, now));
+            assert!(bucket.consume(1, now, &config));
         }
 
         // Should deny when capacity exceeded
-        assert!(!bucket.consume(1, now));
+        assert!(!bucket.consume(1, now, &config));
         assert_eq!(bucket.remaining_tokens(), 0);
     }
 
     #[test]
     fn test_token_bucket_refill() {
-        let mut bucket = TokenBucket::new(10, 10); // 1 token per second
-        let now = unix_secs();
+        let config = RateLimiterConfig {
+            capacity: 10,
+            window: 10, // 1 token per second
+            ..Default::default()
+        };
+        let mut bucket = TokenBucket::new(10, 10);
+        let now = Instant::now();
 
         // Consume all tokens
         for _ in 0..10 {
-            assert!(bucket.consume(1, now));
+            assert!(bucket.consume(1, now, &config));
         }
-        assert!(!bucket.consume(1, now));
+        assert!(!bucket.consume(1, now, &config));
 
         // After 5 seconds, should have 5 tokens
-        bucket.refill(now + 5);
+        let later = now + Duration::from_secs(5);
+        bucket.refill(later, &config);
         assert_eq!(bucket.remaining_tokens(), 5);
 
         // Should be able to consume 5 tokens
         for _ in 0..5 {
-            assert!(bucket.consume(1, now + 5));
+            assert!(bucket.consume(1, later, &config));
         }
-        assert!(!bucket.consume(1, now + 5));
+        assert!(!bucket.consume(1, later, &config));
     }
 
-    #[test]
-    fn test_rate_limiter() {
+    #[tokio::test]
+    async fn test_rate_limiter() {
         let config = RateLimiterConfig {
             capacity: 5,
             window: 1,
             ..Default::default()
         };
         let limiter = RateLimiter::with_config(config);
-        let ip = "192.168.1.1";
+        let ip = "192.168.1.1".parse::<IpAddr>().unwrap();
 
         // Should allow up to capacity
         for i in 0..5 {
@@ -466,13 +506,15 @@ mod tests {
         assert_eq!(result.remaining, 0);
     }
 
-    #[test]
-    fn test_rate_limiter_different_ips() {
+    #[tokio::test]
+    async fn test_rate_limiter_different_ips() {
         let limiter = RateLimiter::new(2, 60);
 
         // Different IPs should have separate limits
-        let result1 = limiter.check_rate_limit("192.168.1.1");
-        let result2 = limiter.check_rate_limit("192.168.1.2");
+        let ip1 = "192.168.1.1".parse::<IpAddr>().unwrap();
+        let ip2 = "192.168.1.2".parse::<IpAddr>().unwrap();
+        let result1 = limiter.check_rate_limit(ip1);
+        let result2 = limiter.check_rate_limit(ip2);
 
         assert!(result1.allowed);
         assert!(result2.allowed);

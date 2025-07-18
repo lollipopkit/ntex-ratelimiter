@@ -8,15 +8,6 @@ A rate limiting middleware for the [ntex](https://github.com/ntex-rs/ntex) web f
 
 ## Installation
 
-Add this to your `Cargo.toml`:
-
-```toml
-[dependencies]
-ntex-ratelimiter = "^0"
-```
-
-### Feature Flags
-
 - `tokio` (default): Enable Tokio runtime support
 - `async-std`: Enable async-std runtime support
 - `json` (default): Enable JSON serialization for error responses
@@ -33,10 +24,17 @@ ntex-ratelimiter = { version = "^0", default-features = false, features = ["asyn
 ntex-ratelimiter = { version = "^0", default-features = false, features = ["tokio"] }
 ```
 
+## Usage
+
+The primary components are `RateLimiter` and `RateLimit`.
+
+- `RateLimiter`: Manages the rate limiting logic and state. You create an instance of this, often shared across your application.
+- `RateLimit`: The `ntex` middleware that wraps your services and applies the rate limiting rules defined by a `RateLimiter` instance.
+
 ## Quick Start
 
 ```rust
-use ntex::{web, App, HttpServer};
+use ntex::web;
 use ntex_ratelimiter::{RateLimit, RateLimiter};
 
 #[ntex::main]
@@ -44,8 +42,8 @@ async fn main() -> std::io::Result<()> {
     // Create a rate limiter: 100 requests per 60 seconds
     let limiter = RateLimiter::new(100, 60);
     
-    HttpServer::new(move || {
-        App::new()
+    web::HttpServer::new(move || {
+        web::App::new()
             // Apply rate limiting middleware
             .wrap(RateLimit::new(limiter.clone()))
             .service(web::resource("/").to(|| async { "Hello world!" }))
@@ -123,88 +121,14 @@ When rate limits are exceeded, a `429 Too Many Requests` response is returned:
 }
 ```
 
-## Configuration Options
+## Module Structure
 
-### RateLimiterConfig
+- `limiter`: Contains the core `RateLimiter` logic, `TokenBucket` implementation, `RateLimiterConfig`, and the `RateLimit` ntex middleware.
 
-|Field             |Type      |Default  |Description                                 |
-|------------------|----------|---------|--------------------------------------------|
-|`capacity`        |`usize`   |100      |Maximum requests allowed in the time window |
-|`window`          |`u64`     |60       |Time window in seconds                      |
-|`cleanup_interval`|`Duration`|5 minutes|How often to clean up stale entries         |
-|`stale_threshold` |`u64`     |1 hour   |How long before entries are considered stale|
+## Contributing
 
-## Examples
-
-### Basic Web API
-
-```rust
-use ntex::{web, App, HttpServer, HttpResponse};
-use ntex_ratelimiter::{RateLimit, RateLimiter};
-
-async fn api_handler() -> HttpResponse {
-    HttpResponse::Ok().json(serde_json::json!({
-        "message": "API response",
-        "timestamp": chrono::Utc::now()
-    }))
-}
-
-#[ntex::main]
-async fn main() -> std::io::Result<()> {
-    // 1000 requests per hour for API endpoints
-    let api_limiter = RateLimiter::new(1000, 3600);
-    
-    HttpServer::new(move || {
-        App::new()
-            .service(
-                web::scope("/api")
-                    .wrap(RateLimit::new(api_limiter.clone()))
-                    .route("/data", web::get().to(api_handler))
-            )
-    })
-    .bind("0.0.0.0:8080")?
-    .run()
-    .await
-}
-```
-
-### Multiple Rate Limits
-
-```rust
-use ntex::{web, App, HttpServer};
-use ntex_ratelimiter::{RateLimit, RateLimiter};
-
-#[ntex::main]
-async fn main() -> std::io::Result<()> {
-    // Different limits for different endpoints
-    let strict_limiter = RateLimiter::new(10, 60);   // 10/minute for auth
-    let normal_limiter = RateLimiter::new(100, 60);  // 100/minute for API
-    let loose_limiter = RateLimiter::new(1000, 60);  // 1000/minute for static
-    
-    HttpServer::new(move || {
-        App::new()
-            .service(
-                web::scope("/auth")
-                    .wrap(RateLimit::new(strict_limiter.clone()))
-                    .route("/login", web::post().to(|| async { "Login" }))
-            )
-            .service(
-                web::scope("/api")
-                    .wrap(RateLimit::new(normal_limiter.clone()))
-                    .route("/users", web::get().to(|| async { "Users" }))
-            )
-            .service(
-                web::scope("/static")
-                    .wrap(RateLimit::new(loose_limiter.clone()))
-                    .route("/images/{file}", web::get().to(|| async { "Image" }))
-            )
-    })
-    .bind("127.0.0.1:8080")?
-    .run()
-    .await
-}
-```
+Contributions are welcome! Please feel free to open an issue or submit a pull request.
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+MIT All contributor.
