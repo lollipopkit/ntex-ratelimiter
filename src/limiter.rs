@@ -29,7 +29,7 @@ struct TokenBucket {
 }
 
 impl TokenBucket {
-    fn new(capacity: usize, _window: u64) -> Self {
+    fn new(capacity: usize) -> Self {
         Self {
             tokens: capacity as f64,
             last_refill: Instant::now(),
@@ -59,23 +59,20 @@ impl TokenBucket {
     }
 
     fn reset_time(&self, _now: Instant, config: &RateLimiterConfig) -> u64 {
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
         if self.tokens >= config.capacity as f64 {
-            // Already at capacity, reset time is now
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs()
-        } else {
-            let missing_tokens = config.capacity as f64 - self.tokens;
-            let refill_rate = config.capacity as f64 / config.window as f64;
-            let seconds_to_refill = missing_tokens / refill_rate;
-            // Calculate Unix timestamp when bucket will be reset
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs()
-                + seconds_to_refill.ceil() as u64
+            return now_secs;
         }
+
+        let missing_tokens = config.capacity as f64 - self.tokens;
+        let refill_rate = config.capacity as f64 / config.window as f64;
+        let seconds_to_refill = missing_tokens / refill_rate;
+
+        now_secs + seconds_to_refill.ceil() as u64
     }
 
     /// Check if this bucket is stale (hasn't been used recently)
@@ -124,6 +121,8 @@ impl RateLimiter {
 
     /// Create a new rate limiter with custom configuration
     pub fn with_config(config: RateLimiterConfig) -> Arc<Self> {
+        assert!(config.window > 0, "RateLimiter window must be greater than zero");
+
         let limiter = Arc::new(RateLimiter {
             map: DashMap::new(),
             config,
@@ -170,7 +169,7 @@ impl RateLimiter {
         let mut bucket = self
             .map
             .entry(identifier)
-            .or_insert_with(|| TokenBucket::new(self.config.capacity, self.config.window));
+            .or_insert_with(|| TokenBucket::new(self.config.capacity));
 
         let allowed = bucket.consume(1, now, &self.config);
         let remaining = bucket.remaining_tokens();
@@ -442,7 +441,7 @@ mod tests {
             window: 10,
             ..Default::default()
         };
-        let mut bucket = TokenBucket::new(5, 10);
+        let mut bucket = TokenBucket::new(5);
         let now = Instant::now();
 
         // Should allow up to capacity
@@ -462,7 +461,7 @@ mod tests {
             window: 10, // 1 token per second
             ..Default::default()
         };
-        let mut bucket = TokenBucket::new(10, 10);
+        let mut bucket = TokenBucket::new(10);
         let now = Instant::now();
 
         // Consume all tokens
