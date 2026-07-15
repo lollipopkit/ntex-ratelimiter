@@ -99,7 +99,7 @@ By default the middleware uses only the **peer socket address** — zero-allocat
 
 ### Memory Safety
 
-The number of tracked client buckets is capped by `max_entries` (default `100_000`). Once the cap is reached, previously-unseen clients share a single overflow bucket (still rate-limited), so an attacker rotating source identifiers — whether real IPs or forged proxy headers — cannot exhaust memory.
+The number of tracked client buckets is bounded by `max_entries` (default `100_000`). Once the cap is reached, previously-unseen clients share a single overflow bucket (still rate-limited, and itself counted toward the cap), so an attacker rotating source identifiers — whether real IPs or forged proxy headers — cannot exhaust memory. The bound is best-effort: concurrent requests may transiently exceed it by roughly the number in flight, but never unboundedly.
 
 ## Response Headers
 

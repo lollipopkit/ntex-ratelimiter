@@ -108,9 +108,14 @@ pub struct RateLimiterConfig {
     /// is the *proxy's* for every request, so all clients share one bucket and
     /// are throttled together. Set this to `true` in that deployment.
     pub trust_proxy_headers: bool,
-    /// Maximum number of tracked client buckets. Once reached, previously
-    /// unseen clients share a single overflow bucket (still rate-limited) so
-    /// that an attacker cannot exhaust memory by rotating source identifiers.
+    /// Soft cap on the number of tracked client buckets. Once the live count
+    /// reaches this value, previously unseen clients share a single overflow
+    /// bucket (still rate-limited) so that an attacker cannot exhaust memory by
+    /// rotating source identifiers. The shared overflow bucket is not
+    /// additional — it counts toward this cap (occupying one of the
+    /// `max_entries` slots). The bound is best-effort: concurrent admissions
+    /// may transiently exceed it by roughly the number of in-flight requests,
+    /// but never unboundedly.
     pub max_entries: usize,
 }
 
@@ -131,9 +136,9 @@ impl Default for RateLimiterConfig {
 pub struct RateLimiter {
     map: DashMap<IpAddr, TokenBucket>,
     config: RateLimiterConfig,
-    /// Best-effort count of live entries in `map`, used as a cheap stand-in for
-    /// `map.len()` (which read-locks every shard). Incremented on insert and
-    /// re-synced to the true length on each [`RateLimiter::cleanup`].
+    /// Live-entry count for `map`, kept as a cheap stand-in for `map.len()`
+    /// (which read-locks every shard): incremented when a bucket is inserted
+    /// and decremented by the number reclaimed on each [`RateLimiter::cleanup`].
     entries: AtomicUsize,
 }
 
@@ -151,6 +156,10 @@ impl RateLimiter {
     /// Create a new rate limiter with custom configuration
     pub fn with_config(config: RateLimiterConfig) -> Arc<Self> {
         assert!(config.window > 0, "RateLimiter window must be greater than zero");
+        assert!(
+            !config.cleanup_interval.is_zero(),
+            "RateLimiter cleanup_interval must be greater than zero"
+        );
 
         let limiter = Arc::new(RateLimiter {
             map: DashMap::new(),
@@ -259,20 +268,24 @@ impl RateLimiter {
         let now = Instant::now();
         let stale_threshold = self.config.stale_threshold;
 
-        let initial_size = self.map.len();
-        self.map
-            .retain(|_, bucket| !bucket.is_stale(now, stale_threshold));
-        let final_size = self.map.len();
+        // Count removals inside `retain` and decrement the counter by that
+        // exact amount (rather than storing `map.len()`), so `fetch_add`s from
+        // inserts racing with this cleanup are preserved, not clobbered.
+        let mut removed = 0usize;
+        self.map.retain(|_, bucket| {
+            let keep = !bucket.is_stale(now, stale_threshold);
+            if !keep {
+                removed += 1;
+            }
+            keep
+        });
 
-        // Re-sync the best-effort counter to the true size, bounding any drift
-        // accumulated from concurrent inserts to a single cleanup interval.
-        self.entries.store(final_size, Ordering::Relaxed);
+        if removed > 0 {
+            self.entries.fetch_sub(removed, Ordering::Relaxed);
 
-        if cfg!(debug_assertions) && initial_size > final_size {
-            eprintln!(
-                "Cleaned {} stale rate limit entries",
-                initial_size - final_size
-            );
+            if cfg!(debug_assertions) {
+                eprintln!("Cleaned {removed} stale rate limit entries");
+            }
         }
     }
 
@@ -679,6 +692,17 @@ mod tests {
                 ..Default::default()
             });
             check_overflow_routing(&limiter);
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "cleanup_interval must be greater than zero")]
+    fn test_zero_cleanup_interval_rejected() {
+        // The assertion fires before the cleanup task is spawned, so no runtime
+        // is needed and both the tokio and smol paths are covered.
+        let _ = RateLimiter::with_config(RateLimiterConfig {
+            cleanup_interval: Duration::ZERO,
+            ..Default::default()
         });
     }
 
