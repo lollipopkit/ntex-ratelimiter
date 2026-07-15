@@ -4,6 +4,7 @@ use ntex::http::header::{HeaderName, HeaderValue};
 use ntex::service::cfg::SharedCfg;
 use ntex::{http::StatusCode, Middleware, ServiceCtx};
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use ntex::{web, Service};
@@ -25,8 +26,9 @@ const HEADER_RATELIMIT_RESET: &str = "x-ratelimit-reset";
 /// Sentinel IP used as a shared bucket for previously-unseen clients once the
 /// map reaches [`RateLimiterConfig::max_entries`], so that attackers rotating
 /// source identifiers cannot exhaust memory and remain rate-limited.
-/// `0.0.0.0` is not a valid client source address, so it never collides with a
-/// real peer.
+/// The unspecified address (`0.0.0.0`) is never a valid client source, and
+/// [`extract_client_ip`] rejects unspecified values parsed from proxy headers,
+/// so this sentinel never collides with an accepted client IP.
 const OVERFLOW_KEY: IpAddr = IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
 
 /// Token bucket algorithm implementation for rate limiting
@@ -100,6 +102,11 @@ pub struct RateLimiterConfig {
     /// headers. Defaults to `false`: only the direct peer socket address is
     /// used, which a client cannot spoof. Enable only behind a trusted proxy
     /// that overwrites (not appends to) these headers.
+    ///
+    /// Note the flip side of the secure default: when the app runs behind a
+    /// reverse proxy or load balancer and this stays `false`, the peer address
+    /// is the *proxy's* for every request, so all clients share one bucket and
+    /// are throttled together. Set this to `true` in that deployment.
     pub trust_proxy_headers: bool,
     /// Maximum number of tracked client buckets. Once reached, previously
     /// unseen clients share a single overflow bucket (still rate-limited) so
@@ -124,6 +131,10 @@ impl Default for RateLimiterConfig {
 pub struct RateLimiter {
     map: DashMap<IpAddr, TokenBucket>,
     config: RateLimiterConfig,
+    /// Best-effort count of live entries in `map`, used as a cheap stand-in for
+    /// `map.len()` (which read-locks every shard). Incremented on insert and
+    /// re-synced to the true length on each [`RateLimiter::cleanup`].
+    entries: AtomicUsize,
 }
 
 impl RateLimiter {
@@ -144,6 +155,7 @@ impl RateLimiter {
         let limiter = Arc::new(RateLimiter {
             map: DashMap::new(),
             config,
+            entries: AtomicUsize::new(0),
         });
 
         // Start periodic cleanup if a runtime is enabled
@@ -198,8 +210,15 @@ impl RateLimiter {
         // a rotating-IP attack while still rate-limiting the attacker (alongside
         // any other unseen clients). The check is best-effort: concurrent
         // inserts may briefly exceed `max_entries`, but never unboundedly.
-        let key = if self.map.contains_key(&identifier)
-            || self.map.len() < self.config.max_entries
+        //
+        // The occupancy gate reads the `entries` atomic rather than `map.len()`
+        // (which read-locks every shard), so the common under-capacity path
+        // takes no extra lookups. Only once the map is full do we pay a single
+        // `contains_key` to tell an already-tracked client apart from a new one
+        // — exactly the path a rotating-IP flood takes, where a full `len()`
+        // scan per request would amplify the very DoS this cap defends against.
+        let key = if self.entries.load(Ordering::Relaxed) < self.config.max_entries
+            || self.map.contains_key(&identifier)
         {
             identifier
         } else {
@@ -210,10 +229,13 @@ impl RateLimiter {
         // timestamp is computed afterwards (allocation-free) to minimize
         // contention on the per-shard lock.
         let (allowed, tokens) = {
-            let mut bucket = self
-                .map
-                .entry(key)
-                .or_insert_with(|| TokenBucket::new(limit));
+            let mut bucket = self.map.entry(key).or_insert_with(|| {
+                // Runs only when a new bucket is actually inserted, so the
+                // counter tracks real growth (including the overflow bucket,
+                // matching the previous `len()`-based accounting).
+                self.entries.fetch_add(1, Ordering::Relaxed);
+                TokenBucket::new(limit)
+            });
             let allowed = bucket.consume(1, now, &self.config);
             (allowed, bucket.tokens)
         };
@@ -241,6 +263,10 @@ impl RateLimiter {
         self.map
             .retain(|_, bucket| !bucket.is_stale(now, stale_threshold));
         let final_size = self.map.len();
+
+        // Re-sync the best-effort counter to the true size, bounding any drift
+        // accumulated from concurrent inserts to a single cleanup interval.
+        self.entries.store(final_size, Ordering::Relaxed);
 
         if cfg!(debug_assertions) && initial_size > final_size {
             eprintln!(
@@ -347,7 +373,11 @@ fn extract_client_ip<Err>(req: &web::WebRequest<Err>, trust_proxy_headers: bool)
                 if let Some(ip) = forwarded_str.split(',').next() {
                     let ip = ip.trim();
                     if let Ok(parsed_ip) = ip.parse::<IpAddr>() {
-                        return parsed_ip;
+                        // Reject `0.0.0.0` / `::` so a forged header cannot map
+                        // a client onto the `OVERFLOW_KEY` sentinel.
+                        if !parsed_ip.is_unspecified() {
+                            return parsed_ip;
+                        }
                     }
                 }
             }
@@ -358,7 +388,9 @@ fn extract_client_ip<Err>(req: &web::WebRequest<Err>, trust_proxy_headers: bool)
             if let Ok(ip_str) = real_ip.to_str() {
                 let ip = ip_str.trim();
                 if let Ok(parsed_ip) = ip.parse::<IpAddr>() {
-                    return parsed_ip;
+                    if !parsed_ip.is_unspecified() {
+                        return parsed_ip;
+                    }
                 }
             }
         }
@@ -685,6 +717,16 @@ mod tests {
         // Trusted but malformed header -> falls back to peer / localhost.
         let req = TestRequest::default()
             .header("x-forwarded-for", "not-an-ip")
+            .to_srv_request();
+        assert_eq!(
+            extract_client_ip(&req, true),
+            "127.0.0.1".parse::<IpAddr>().unwrap()
+        );
+
+        // Trusted but unspecified (`0.0.0.0`) header -> rejected, falls back to
+        // peer / localhost, so a client cannot map itself onto OVERFLOW_KEY.
+        let req = TestRequest::default()
+            .header("x-forwarded-for", "0.0.0.0")
             .to_srv_request();
         assert_eq!(
             extract_client_ip(&req, true),

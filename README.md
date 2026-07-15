@@ -95,6 +95,8 @@ By default the middleware uses only the **peer socket address** — zero-allocat
 1. `X-Real-IP` header (only when `trust_proxy_headers = true`)
 1. Peer socket address (default and fallback)
 
+> ⚠️ **Behind a reverse proxy / load balancer**, leaving `trust_proxy_headers = false` means the peer address is the *proxy's* for every request, so all clients share a single bucket and are throttled together. Set `trust_proxy_headers = true` in that deployment (the proxy must overwrite the headers).
+
 ### Memory Safety
 
 The number of tracked client buckets is capped by `max_entries` (default `100_000`). Once the cap is reached, previously-unseen clients share a single overflow bucket (still rate-limited), so an attacker rotating source identifiers — whether real IPs or forged proxy headers — cannot exhaust memory.
