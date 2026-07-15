@@ -9,19 +9,19 @@ A rate limiting middleware for the [ntex](https://github.com/ntex-rs/ntex) web f
 ## Installation
 
 - `tokio` (default): Enable Tokio runtime support
-- `async-std`: Enable async-std runtime support
+- `smol`: Enable smol runtime support (smol is the maintained successor of async-std)
 - `json` (default): Enable JSON serialization for error responses
 
 ```toml
 [dependencies]
 # Default features (tokio + json)
-ntex-ratelimiter = "^0"
+ntex-ratelimiter = "^0.3"
 
-# With async-std instead of tokio
-ntex-ratelimiter = { version = "^0", default-features = false, features = ["async-std", "json"] }
+# With smol instead of tokio
+ntex-ratelimiter = { version = "^0.3", default-features = false, features = ["smol", "json"] }
 
 # Minimal build without JSON support
-ntex-ratelimiter = { version = "^0", default-features = false, features = ["tokio"] }
+ntex-ratelimiter = { version = "^0.3", default-features = false, features = ["tokio"] }
 ```
 
 ## Usage
@@ -42,7 +42,7 @@ async fn main() -> std::io::Result<()> {
     // Create a rate limiter: 100 requests per 60 seconds
     let limiter = RateLimiter::new(100, 60);
     
-    web::HttpServer::new(move || {
+    web::HttpServer::new(async move || {
         web::App::new()
             // Apply rate limiting middleware
             .wrap(RateLimit::new(limiter.clone()))
@@ -66,7 +66,9 @@ let config = RateLimiterConfig {
     capacity: 1000,                              // 1000 requests  
     window: 3600,                               // per hour (3600 seconds)
     cleanup_interval: Duration::from_secs(300), // cleanup every 5 minutes
-    stale_threshold: 7200,                      // remove entries idle for 2+ hours
+    stale_threshold: Duration::from_secs(7200), // remove entries idle for 2+ hours
+    trust_proxy_headers: true,                  // trust XFF/X-Real-IP (only behind a trusted proxy)
+    max_entries: 100_000,                       // cap tracked IPs; overflow shares a bucket
 };
 
 let limiter = RateLimiter::with_config(config);
@@ -87,13 +89,15 @@ This middleware uses the **token bucket algorithm** for rate limiting:
 
 ### Client IP Detection
 
-The middleware intelligently extracts client IPs from:
+By default the middleware uses only the **peer socket address** — zero-allocation and not spoofable by the client. Set `trust_proxy_headers = true` in `RateLimiterConfig` to also honor proxy headers; do this **only** behind a trusted proxy that overwrites (not appends to) them, since clients can otherwise forge these headers to bypass limiting:
 
-1. `X-Forwarded-For` header (first IP in comma-separated list)
-1. `X-Real-IP` header
-1. Connection remote address (fallback)
+1. `X-Forwarded-For` header (first IP, only when `trust_proxy_headers = true`)
+1. `X-Real-IP` header (only when `trust_proxy_headers = true`)
+1. Peer socket address (default and fallback)
 
-This ensures accurate rate limiting even behind proxies and load balancers.
+### Memory Safety
+
+The number of tracked client buckets is capped by `max_entries` (default `100_000`). Once the cap is reached, previously-unseen clients share a single overflow bucket (still rate-limited), so an attacker rotating source identifiers — whether real IPs or forged proxy headers — cannot exhaust memory.
 
 ## Response Headers
 
