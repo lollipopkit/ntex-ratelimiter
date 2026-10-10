@@ -7,17 +7,11 @@ use ntex::service::cfg::SharedCfg;
 use ntex::{http::StatusCode, Middleware, ServiceCtx};
 use std::hash::Hash;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use ntex::{web, Service};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-
-#[cfg(feature = "tokio")]
-use tokio::time::interval;
-
-#[cfg(feature = "smol")]
-use smol::Timer;
 
 const HEADER_RATELIMIT_REMAINING: &str = "x-ratelimit-remaining";
 const HEADER_RATELIMIT_LIMIT: &str = "x-ratelimit-limit";
@@ -87,6 +81,11 @@ fn compute_reset_time(tokens: f64, config: &RateLimiterConfig) -> u64 {
     now_secs + seconds_to_refill.ceil() as u64
 }
 
+/// `Duration` as nanoseconds, saturating (u64 nanoseconds cover ~584 years).
+fn duration_nanos(d: Duration) -> u64 {
+    u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
+}
+
 /// Seconds until the bucket holds at least one token again (`0` if it already does).
 fn compute_retry_after(tokens: f64, config: &RateLimiterConfig) -> u64 {
     if tokens >= 1.0 {
@@ -104,6 +103,11 @@ pub struct RateLimiterConfig {
     /// How often buckets that have refilled to full capacity are reclaimed.
     /// A bucket idle for `window` seconds is always full, so memory is held
     /// for at most about `window + cleanup_interval` after a key goes quiet.
+    ///
+    /// Cleanup runs inline: the first [`RateLimiter::check_rate_limit`] call
+    /// after each interval performs it (one `retain` over the map), so no
+    /// background task or async runtime is needed. Without requests the map
+    /// cannot grow, so nothing is lost by not cleaning while idle.
     pub cleanup_interval: Duration,
     /// Networks of reverse proxies whose `X-Forwarded-For` header is trusted.
     ///
@@ -168,12 +172,13 @@ pub struct RateLimiter<K = IpAddr> {
     /// (which read-locks every shard): incremented when a bucket is inserted
     /// and decremented by the number reclaimed on each [`RateLimiter::cleanup`].
     entries: AtomicUsize,
+    /// Reference point for `next_cleanup`.
+    created: Instant,
+    /// Nanoseconds after `created` at which the next inline cleanup is due.
+    next_cleanup: AtomicU64,
 }
 
-impl<K> RateLimiter<K>
-where
-    K: Hash + Eq + Clone + Send + Sync + 'static,
-{
+impl<K: Hash + Eq + Clone> RateLimiter<K> {
     /// Create a new rate limiter with default configuration
     pub fn new(capacity: usize, window: u64) -> Arc<Self> {
         let config = RateLimiterConfig {
@@ -197,59 +202,23 @@ where
             "RateLimiter cleanup_interval must be greater than zero"
         );
 
-        let limiter = Arc::new(RateLimiter {
+        Arc::new(RateLimiter {
             map: DashMap::new(),
             overflow: Mutex::new(TokenBucket::new(config.capacity)),
+            next_cleanup: AtomicU64::new(duration_nanos(config.cleanup_interval)),
             config,
             entries: AtomicUsize::new(0),
-        });
-
-        // Start periodic cleanup if a runtime is enabled
-        #[cfg(any(feature = "tokio", feature = "smol"))]
-        Self::start_cleanup_task(Arc::clone(&limiter));
-
-        limiter
-    }
-
-    #[cfg(feature = "tokio")]
-    fn start_cleanup_task(limiter: Arc<Self>) {
-        let cleanup_interval = limiter.config.cleanup_interval;
-        let weak = Arc::downgrade(&limiter);
-        tokio::spawn(async move {
-            let mut interval = interval(cleanup_interval);
-            loop {
-                interval.tick().await;
-                // Hold the limiter via a weak reference so the task exits once
-                // all strong references are gone; otherwise the task's `Arc`
-                // would keep the limiter (and its DashMap) alive forever.
-                let Some(limiter) = weak.upgrade() else {
-                    break;
-                };
-                limiter.cleanup();
-            }
-        });
-    }
-
-    #[cfg(feature = "smol")]
-    fn start_cleanup_task(limiter: Arc<Self>) {
-        let cleanup_interval = limiter.config.cleanup_interval;
-        let weak = Arc::downgrade(&limiter);
-        smol::spawn(async move {
-            loop {
-                Timer::after(cleanup_interval).await;
-                let Some(limiter) = weak.upgrade() else {
-                    break;
-                };
-                limiter.cleanup();
-            }
+            created: Instant::now(),
         })
-        .detach();
     }
 
     /// Consume one token from `key`'s bucket.
     ///
     /// The key is only cloned when a new bucket is inserted; checks against an
     /// existing bucket or the overflow bucket never clone it.
+    ///
+    /// Once per [`RateLimiterConfig::cleanup_interval`], one call also runs
+    /// [`RateLimiter::cleanup`] after releasing its bucket.
     pub fn check_rate_limit(&self, key: &K) -> RateLimitResult {
         let now = Instant::now();
 
@@ -281,7 +250,27 @@ where
             None => self.consume_overflow(now),
         };
 
+        // No bucket guard is held here, so `retain` cannot deadlock on it.
+        self.maybe_cleanup(now);
         self.result(allowed, tokens)
+    }
+
+    /// Run [`RateLimiter::cleanup`] if the interval has elapsed. The CAS lets
+    /// exactly one caller per interval do it; the others return immediately.
+    fn maybe_cleanup(&self, now: Instant) {
+        let elapsed = duration_nanos(now.saturating_duration_since(self.created));
+        let due = self.next_cleanup.load(Ordering::Relaxed);
+        if elapsed < due {
+            return;
+        }
+        let next = elapsed.saturating_add(duration_nanos(self.config.cleanup_interval));
+        if self
+            .next_cleanup
+            .compare_exchange(due, next, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            self.cleanup();
+        }
     }
 
     /// Consume one token from the shared overflow bucket, for requests that
@@ -316,12 +305,12 @@ where
 
     /// Reclaim buckets that have refilled to full capacity.
     ///
-    /// Private and only ever invoked from the single task spawned by
-    /// [`start_cleanup_task`], so it unconditionally reclaims full buckets on
-    /// each call. Scheduling relies on that task's monotonic timer rather than
-    /// wall-clock time, so NTP adjustments or a drifting system clock cannot
-    /// stall cleanup.
-    fn cleanup(&self) {
+    /// Called automatically by [`RateLimiter::check_rate_limit`] once per
+    /// [`RateLimiterConfig::cleanup_interval`]; call it directly to reclaim
+    /// memory on your own schedule. Removing a full bucket loses no state.
+    /// Scheduling uses the monotonic clock, so wall-clock adjustments cannot
+    /// stall it.
+    pub fn cleanup(&self) {
         let now = Instant::now();
 
         // Count removals inside `retain` and decrement the counter by that
@@ -421,7 +410,7 @@ impl<Err> KeyExtractor<IpAddr, Err> for PeerIp {
 impl<K, Err, F> KeyExtractor<K, Err> for F
 where
     F: Fn(&web::WebRequest<Err>) -> Option<K>,
-    K: Hash + Eq + Clone + Send + Sync + 'static,
+    K: Hash + Eq + Clone,
 {
     fn check_request(
         &self,
@@ -700,22 +689,6 @@ mod tests {
         assert!(!bucket.consume(1, later, &config));
     }
 
-    // The rate-limit checks themselves are synchronous, so the assertion logic
-    // is runtime-independent. Only `RateLimiter` construction needs a runtime,
-    // because it spawns the cleanup task; `with_rt` provides that context for
-    // whichever runtime feature is enabled.
-    fn with_rt(f: impl FnOnce()) {
-        #[cfg(feature = "tokio")]
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async { f() });
-
-        #[cfg(feature = "smol")]
-        smol::block_on(async { f() });
-    }
-
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
     }
@@ -731,110 +704,100 @@ mod tests {
 
     #[test]
     fn test_rate_limiter() {
-        with_rt(|| {
-            let limiter = RateLimiter::with_config(RateLimiterConfig {
-                capacity: 5,
-                window: 1,
-                ..Default::default()
-            });
-            let ip = ip("192.168.1.1");
-
-            // Should allow up to capacity
-            for i in 0..5 {
-                let result = limiter.check_rate_limit(&ip);
-                assert!(result.allowed, "Request {} should be allowed", i + 1);
-                assert_eq!(result.remaining, 4 - i as u32);
-                assert_eq!(result.retry_after, 0);
-            }
-
-            // Should deny when capacity exceeded
-            let result = limiter.check_rate_limit(&ip);
-            assert!(!result.allowed);
-            assert_eq!(result.remaining, 0);
-            assert_eq!(result.retry_after, 1);
+        let limiter = RateLimiter::with_config(RateLimiterConfig {
+            capacity: 5,
+            window: 1,
+            ..Default::default()
         });
+        let ip = ip("192.168.1.1");
+
+        // Should allow up to capacity
+        for i in 0..5 {
+            let result = limiter.check_rate_limit(&ip);
+            assert!(result.allowed, "Request {} should be allowed", i + 1);
+            assert_eq!(result.remaining, 4 - i as u32);
+            assert_eq!(result.retry_after, 0);
+        }
+
+        // Should deny when capacity exceeded
+        let result = limiter.check_rate_limit(&ip);
+        assert!(!result.allowed);
+        assert_eq!(result.remaining, 0);
+        assert_eq!(result.retry_after, 1);
     }
 
     #[test]
     fn test_rate_limiter_different_ips() {
-        with_rt(|| {
-            // Different IPs should have separate limits
-            let limiter = RateLimiter::new(2, 60);
-            let result1 = limiter.check_rate_limit(&ip("192.168.1.1"));
-            let result2 = limiter.check_rate_limit(&ip("192.168.1.2"));
+        // Different IPs should have separate limits
+        let limiter = RateLimiter::new(2, 60);
+        let result1 = limiter.check_rate_limit(&ip("192.168.1.1"));
+        let result2 = limiter.check_rate_limit(&ip("192.168.1.2"));
 
-            assert!(result1.allowed);
-            assert!(result2.allowed);
-            assert_eq!(result1.remaining, 1);
-            assert_eq!(result2.remaining, 1);
-        });
+        assert!(result1.allowed);
+        assert!(result2.allowed);
+        assert_eq!(result1.remaining, 1);
+        assert_eq!(result2.remaining, 1);
     }
 
     #[test]
     fn test_string_keys_independent() {
-        with_rt(|| {
-            let limiter = RateLimiter::<String>::new(2, 60);
-            let a = "token-a".to_string();
-            let b = "token-b".to_string();
+        let limiter = RateLimiter::<String>::new(2, 60);
+        let a = "token-a".to_string();
+        let b = "token-b".to_string();
 
-            assert!(limiter.check_rate_limit(&a).allowed);
-            assert!(limiter.check_rate_limit(&a).allowed);
-            assert!(!limiter.check_rate_limit(&a).allowed);
+        assert!(limiter.check_rate_limit(&a).allowed);
+        assert!(limiter.check_rate_limit(&a).allowed);
+        assert!(!limiter.check_rate_limit(&a).allowed);
 
-            let result = limiter.check_rate_limit(&b);
-            assert!(result.allowed, "token-b must not share token-a's bucket");
-            assert_eq!(result.remaining, 1);
-            assert_eq!(limiter.stats().active_entries, 2);
-        });
+        let result = limiter.check_rate_limit(&b);
+        assert!(result.allowed, "token-b must not share token-a's bucket");
+        assert_eq!(result.remaining, 1);
+        assert_eq!(limiter.stats().active_entries, 2);
     }
 
     #[test]
     fn test_overflow_bucket() {
-        with_rt(|| {
-            let limiter = RateLimiter::with_config(config(1, 2));
-            let (ip1, ip2) = (ip("10.0.0.1"), ip("10.0.0.2"));
+        let limiter = RateLimiter::with_config(config(1, 2));
+        let (ip1, ip2) = (ip("10.0.0.1"), ip("10.0.0.2"));
 
-            // ip1 and ip2 each get their own bucket (capacity 1).
-            assert!(limiter.check_rate_limit(&ip1).allowed);
-            assert!(limiter.check_rate_limit(&ip2).allowed);
+        // ip1 and ip2 each get their own bucket (capacity 1).
+        assert!(limiter.check_rate_limit(&ip1).allowed);
+        assert!(limiter.check_rate_limit(&ip2).allowed);
 
-            // Map is at capacity; unseen ip3 is routed to the overflow bucket,
-            // which is fresh (capacity 1) -> allowed.
-            assert!(
-                limiter.check_rate_limit(&ip("10.0.0.3")).allowed,
-                "first overflow hit should be allowed"
-            );
-            // ip4 is unseen but shares the now-empty overflow bucket -> denied.
-            assert!(
-                !limiter.check_rate_limit(&ip("10.0.0.4")).allowed,
-                "second overflow hit should be denied"
-            );
+        // Map is at capacity; unseen ip3 is routed to the overflow bucket,
+        // which is fresh (capacity 1) -> allowed.
+        assert!(
+            limiter.check_rate_limit(&ip("10.0.0.3")).allowed,
+            "first overflow hit should be allowed"
+        );
+        // ip4 is unseen but shares the now-empty overflow bucket -> denied.
+        assert!(
+            !limiter.check_rate_limit(&ip("10.0.0.4")).allowed,
+            "second overflow hit should be denied"
+        );
 
-            // The overflow bucket is not part of the map.
-            assert_eq!(limiter.map.len(), 2);
-            assert_eq!(limiter.entries.load(Ordering::Relaxed), 2);
-        });
+        // The overflow bucket is not part of the map.
+        assert_eq!(limiter.map.len(), 2);
+        assert_eq!(limiter.entries.load(Ordering::Relaxed), 2);
     }
 
     #[test]
     fn test_overflow_leaves_existing_keys_alone() {
-        with_rt(|| {
-            let limiter = RateLimiter::<String>::with_config(config(2, 1));
-            let known = "known".to_string();
+        let limiter = RateLimiter::<String>::with_config(config(2, 1));
+        let known = "known".to_string();
 
-            assert!(limiter.check_rate_limit(&known).allowed);
+        assert!(limiter.check_rate_limit(&known).allowed);
 
-            // Exhaust the overflow bucket with unseen keys.
-            assert!(limiter.check_rate_limit(&"new-1".to_string()).allowed);
-            assert!(limiter.check_rate_limit(&"new-2".to_string()).allowed);
-            assert!(!limiter.check_rate_limit(&"new-3".to_string()).allowed);
+        // Exhaust the overflow bucket with unseen keys.
+        assert!(limiter.check_rate_limit(&"new-1".to_string()).allowed);
+        assert!(limiter.check_rate_limit(&"new-2".to_string()).allowed);
+        assert!(!limiter.check_rate_limit(&"new-3".to_string()).allowed);
 
-            // The tracked key keeps its own bucket.
-            let result = limiter.check_rate_limit(&known);
-            assert!(result.allowed);
-            assert_eq!(result.remaining, 0);
-            assert_eq!(limiter.stats().active_entries, 1);
-        });
+        // The tracked key keeps its own bucket.
+        let result = limiter.check_rate_limit(&known);
+        assert!(result.allowed);
+        assert_eq!(result.remaining, 0);
+        assert_eq!(limiter.stats().active_entries, 1);
     }
 
     /// Key whose `Clone` impl counts invocations; identity is `id` only.
@@ -869,133 +832,164 @@ mod tests {
 
     #[test]
     fn test_check_clones_only_on_insert() {
-        with_rt(|| {
-            let clones = Arc::new(AtomicUsize::new(0));
-            let key = |id| CountingKey {
-                id,
-                clones: Arc::clone(&clones),
-            };
-            let limiter = RateLimiter::with_config(config(10, 1));
-            let (a, b) = (key(1), key(2));
+        let clones = Arc::new(AtomicUsize::new(0));
+        let key = |id| CountingKey {
+            id,
+            clones: Arc::clone(&clones),
+        };
+        let limiter = RateLimiter::with_config(config(10, 1));
+        let (a, b) = (key(1), key(2));
 
+        limiter.check_rate_limit(&a);
+        assert_eq!(clones.load(Ordering::Relaxed), 1, "insert clones once");
+
+        for _ in 0..5 {
             limiter.check_rate_limit(&a);
-            assert_eq!(clones.load(Ordering::Relaxed), 1, "insert clones once");
+        }
+        assert_eq!(clones.load(Ordering::Relaxed), 1, "existing bucket: no clone");
 
-            for _ in 0..5 {
-                limiter.check_rate_limit(&a);
-            }
-            assert_eq!(clones.load(Ordering::Relaxed), 1, "existing bucket: no clone");
-
-            // Map is full, so `b` goes to the overflow bucket without a clone.
-            limiter.check_rate_limit(&b);
-            assert_eq!(clones.load(Ordering::Relaxed), 1, "overflow: no clone");
-        });
+        // Map is full, so `b` goes to the overflow bucket without a clone.
+        limiter.check_rate_limit(&b);
+        assert_eq!(clones.load(Ordering::Relaxed), 1, "overflow: no clone");
     }
 
     #[test]
     fn test_concurrent_entries_do_not_drift() {
-        with_rt(|| {
-            const THREADS: u32 = 8;
-            const KEYS: u32 = 500;
-            // 1000 tokens/s, so drained buckets refill within milliseconds.
-            let limiter = RateLimiter::<u32>::with_config(RateLimiterConfig {
-                window: 1,
-                ..config(1_000, 1_000_000)
-            });
-
-            std::thread::scope(|s| {
-                for t in 0..THREADS {
-                    let limiter = &limiter;
-                    s.spawn(move || {
-                        // Overlapping key ranges force racing inserts of the
-                        // same key across threads.
-                        for k in 0..KEYS {
-                            limiter.check_rate_limit(&((k + t * 7) % KEYS));
-                        }
-                    });
-                }
-            });
-
-            assert_eq!(limiter.map.len(), KEYS as usize);
-            assert_eq!(limiter.entries.load(Ordering::Relaxed), KEYS as usize);
-
-            // Once every bucket has refilled, cleanup reclaims all of them and
-            // the counter must return to zero.
-            std::thread::sleep(Duration::from_millis(50));
-            limiter.cleanup();
-            assert_eq!(limiter.map.len(), 0);
-            assert_eq!(limiter.entries.load(Ordering::Relaxed), 0);
+        const THREADS: u32 = 8;
+        const KEYS: u32 = 500;
+        // 1000 tokens/s, so drained buckets refill within milliseconds.
+        let limiter = RateLimiter::<u32>::with_config(RateLimiterConfig {
+            window: 1,
+            ..config(1_000, 1_000_000)
         });
+
+        std::thread::scope(|s| {
+            for t in 0..THREADS {
+                let limiter = &limiter;
+                s.spawn(move || {
+                    // Overlapping key ranges force racing inserts of the
+                    // same key across threads.
+                    for k in 0..KEYS {
+                        limiter.check_rate_limit(&((k + t * 7) % KEYS));
+                    }
+                });
+            }
+        });
+
+        assert_eq!(limiter.map.len(), KEYS as usize);
+        assert_eq!(limiter.entries.load(Ordering::Relaxed), KEYS as usize);
+
+        // Once every bucket has refilled, cleanup reclaims all of them and
+        // the counter must return to zero.
+        std::thread::sleep(Duration::from_millis(50));
+        limiter.cleanup();
+        assert_eq!(limiter.map.len(), 0);
+        assert_eq!(limiter.entries.load(Ordering::Relaxed), 0);
     }
 
     #[test]
     fn test_cleanup_reclaims_only_full_buckets() {
-        with_rt(|| {
-            // 1 token per 6s: a drained bucket stays non-full for the test.
-            let limiter = RateLimiter::<&str>::with_config(config(10, 100));
-            limiter.check_rate_limit(&"busy");
-            limiter.cleanup();
-            assert_eq!(limiter.stats().active_entries, 1, "non-full bucket kept");
+        // 1 token per 6s: a drained bucket stays non-full for the test.
+        let limiter = RateLimiter::<&str>::with_config(config(10, 100));
+        limiter.check_rate_limit(&"busy");
+        limiter.cleanup();
+        assert_eq!(limiter.stats().active_entries, 1, "non-full bucket kept");
 
-            // 1000 tokens/s: refills within a millisecond.
-            let limiter = RateLimiter::<&str>::with_config(RateLimiterConfig {
-                window: 1,
-                ..config(1_000, 100)
-            });
-            limiter.check_rate_limit(&"idle");
-            std::thread::sleep(Duration::from_millis(20));
-            limiter.cleanup();
-            assert_eq!(limiter.stats().active_entries, 0, "full bucket reclaimed");
-            assert_eq!(limiter.map.len(), 0);
+        // 1000 tokens/s: refills within a millisecond.
+        let limiter = RateLimiter::<&str>::with_config(RateLimiterConfig {
+            window: 1,
+            ..config(1_000, 100)
         });
+        limiter.check_rate_limit(&"idle");
+        std::thread::sleep(Duration::from_millis(20));
+        limiter.cleanup();
+        assert_eq!(limiter.stats().active_entries, 0, "full bucket reclaimed");
+        assert_eq!(limiter.map.len(), 0);
+    }
+
+    #[test]
+    fn test_inline_cleanup() {
+        // 10 tokens/s: a used bucket needs 100ms to refill.
+        let limiter = RateLimiter::<&str>::with_config(RateLimiterConfig {
+            window: 1,
+            cleanup_interval: Duration::from_millis(50),
+            ..config(10, 100)
+        });
+        limiter.check_rate_limit(&"a");
+        assert_eq!(limiter.stats().active_entries, 1, "not due yet");
+
+        // After 150ms "a" is full and cleanup is due: the next check reclaims
+        // "a" but keeps the bucket it just drained.
+        std::thread::sleep(Duration::from_millis(150));
+        limiter.check_rate_limit(&"b");
+        assert!(!limiter.map.contains_key(&"a"));
+        assert!(limiter.map.contains_key(&"b"));
+        assert_eq!(limiter.stats().active_entries, 1);
+    }
+
+    #[test]
+    fn test_inline_cleanup_runs_once_per_interval() {
+        let limiter = RateLimiter::<u32>::with_config(RateLimiterConfig {
+            cleanup_interval: Duration::from_millis(20),
+            ..config(10, 100)
+        });
+        std::thread::sleep(Duration::from_millis(30));
+        let due = limiter.next_cleanup.load(Ordering::Relaxed);
+
+        // Many concurrent callers past the deadline advance it exactly once.
+        std::thread::scope(|s| {
+            for k in 0..8 {
+                let limiter = &limiter;
+                s.spawn(move || limiter.check_rate_limit(&k));
+            }
+        });
+        let next = limiter.next_cleanup.load(Ordering::Relaxed);
+        assert!(next > due);
+        assert!(next - due < duration_nanos(Duration::from_millis(20)) * 2);
     }
 
     #[test]
     fn test_unknown_peer_uses_overflow_bucket() {
-        with_rt(|| {
-            let limiter = RateLimiter::with_config(config(1, 100));
-            let localhost = ip("127.0.0.1");
+        let limiter = RateLimiter::with_config(config(1, 100));
+        let localhost = ip("127.0.0.1");
 
-            // Test requests carry no peer address.
-            let req = TestRequest::default().to_srv_request();
-            let result = PeerIp.check_request(&req, &limiter).unwrap();
-            assert!(result.allowed);
-            assert!(
-                !PeerIp.check_request(&req, &limiter).unwrap().allowed,
-                "unknown peers share the overflow bucket"
-            );
+        // Test requests carry no peer address.
+        let req = TestRequest::default().to_srv_request();
+        let result = PeerIp.check_request(&req, &limiter).unwrap();
+        assert!(result.allowed);
+        assert!(
+            !PeerIp.check_request(&req, &limiter).unwrap().allowed,
+            "unknown peers share the overflow bucket"
+        );
 
-            // No per-IP bucket was created, so genuine localhost is unaffected.
-            assert_eq!(limiter.stats().active_entries, 0);
-            assert!(limiter.check_rate_limit(&localhost).allowed);
-            assert_eq!(limiter.stats().active_entries, 1);
-        });
+        // No per-IP bucket was created, so genuine localhost is unaffected.
+        assert_eq!(limiter.stats().active_entries, 0);
+        assert!(limiter.check_rate_limit(&localhost).allowed);
+        assert_eq!(limiter.stats().active_entries, 1);
     }
 
     #[test]
     fn test_custom_key_extractor() {
-        with_rt(|| {
-            let limiter = RateLimiter::<String>::new(1, 60);
-            let key = |req: &web::WebRequest<web::DefaultError>| {
-                req.headers()
-                    .get("x-api-token")
-                    .and_then(|v| v.to_str().ok())
-                    .map(str::to_owned)
-            };
-            let mw = RateLimit::with_key(Arc::clone(&limiter), key);
+        let limiter = RateLimiter::<String>::new(1, 60);
+        let key = |req: &web::WebRequest<web::DefaultError>| {
+            req.headers()
+                .get("x-api-token")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        };
+        let mw = RateLimit::with_key(Arc::clone(&limiter), key);
 
-            let with_token = || {
-                TestRequest::default()
-                    .header("x-api-token", "t1")
-                    .to_srv_request()
-            };
-            assert!(mw.key.check_request(&with_token(), &limiter).unwrap().allowed);
-            assert!(!mw.key.check_request(&with_token(), &limiter).unwrap().allowed);
+        let with_token = || {
+            TestRequest::default()
+                .header("x-api-token", "t1")
+                .to_srv_request()
+        };
+        assert!(mw.key.check_request(&with_token(), &limiter).unwrap().allowed);
+        assert!(!mw.key.check_request(&with_token(), &limiter).unwrap().allowed);
 
-            // No key -> not rate-limited.
-            let req = TestRequest::default().to_srv_request();
-            assert!(mw.key.check_request(&req, &limiter).is_none());
-        });
+        // No key -> not rate-limited.
+        let req = TestRequest::default().to_srv_request();
+        assert!(mw.key.check_request(&req, &limiter).is_none());
     }
 
     #[test]
@@ -1032,8 +1026,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "cleanup_interval must be greater than zero")]
     fn test_zero_cleanup_interval_rejected() {
-        // The assertion fires before the cleanup task is spawned, so no runtime
-        // is needed and both the tokio and smol paths are covered.
         let _ = RateLimiter::<IpAddr>::with_config(RateLimiterConfig {
             cleanup_interval: Duration::ZERO,
             ..Default::default()

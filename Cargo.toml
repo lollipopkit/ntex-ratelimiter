@@ -10,22 +10,10 @@ readme = "README.md"
 keywords = ["ntex", "rate-limiter", "middleware", "token-bucket"]
 categories = ["web-programming", "network-programming"]
 
-[features]
-default = ["tokio"]
-tokio = ["dep:tokio"]
-smol = ["dep:smol"]
-
 [dependencies]
 dashmap = "6"
 ipnet = "2"
 itoa = "1"
 ntex = "3"
-tokio = { version = "1", features = [
-    "sync",
-    "time",
-    "rt",
-    "macros",
-], optional = true }
-smol = { version = "2", optional = true }
 
 [dev-dependencies]

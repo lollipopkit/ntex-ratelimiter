@@ -12,10 +12,10 @@
 //! - **Spoofing-Resistant**: Defaults to the unspoofable peer socket address; `X-Forwarded-For` is only read from `trusted_proxies`, taking the rightmost untrusted hop.
 //! - **Bounded Memory**: A `max_entries` cap routes excess unseen keys to a shared overflow bucket, so rotating-IP attacks cannot exhaust memory.
 //! - **Configurable**: Capacity, time window, cleanup interval, proxy-header trust, and max entries.
-//! - **Asynchronous Cleanup**: Periodically removes buckets that have refilled to capacity (lossless) to save memory.
+//! - **Inline Cleanup**: Periodically removes buckets that have refilled to capacity (lossless) to save memory, without a background task.
 //! - **Response Headers**: Adds `X-RateLimit-Remaining`, `X-RateLimit-Limit`, and `X-RateLimit-Reset` headers to responses, plus `Retry-After` on 429.
 //! - **Customizable Error Response**: Returns a `429 Too Many Requests` JSON response when limits are exceeded.
-//! - **Runtime Agnostic**: Supports both `tokio` (default) and `smol` runtimes via feature flags.
+//! - **Runtime Agnostic**: Spawns no tasks, so it works on every ntex runtime (tokio, compio, neon) with no feature flags.
 //!
 //! ## Installation
 //!
@@ -24,17 +24,6 @@
 //! ```toml
 //! [dependencies]
 //! ntex-ratelimiter = "^0.4.0"
-//! ```
-//!
-//! ## Feature Flags
-//!
-//! - `tokio` (default): Enables Tokio runtime support.
-//! - `smol`: Enables smol runtime support (smol is the maintained successor of async-std).
-//!
-//! Example with `smol`:
-//! ```toml
-//! [dependencies]
-//! ntex-ratelimiter = { version = "^0.4.0", default-features = false, features = ["smol"] }
 //! ```
 //!
 //! ## Quick Start
@@ -125,16 +114,3 @@ pub use limiter::{
     KeyExtractor, PeerIp, RateLimit, RateLimitResult, RateLimiter, RateLimiterConfig,
     RateLimiterStats,
 };
-
-// Prevent conflicting runtime features
-#[cfg(all(feature = "tokio", feature = "smol"))]
-compile_error!("Features \"tokio\" and \"smol\" cannot be enabled at the same time.");
-
-#[cfg(not(any(feature = "tokio", feature = "smol")))]
-compile_error!("Enable either feature \"tokio\" or \"smol\" for ntex-ratelimiter to work.");
-
-#[cfg(feature = "tokio")]
-pub use tokio;
-
-#[cfg(feature = "smol")]
-pub use smol;

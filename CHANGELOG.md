@@ -9,8 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Breaking
 
 - `RateLimiter` is generic over its key: `RateLimiter<K = IpAddr>`, with
-  `K: Hash + Eq + Clone + Send + Sync + 'static`. Existing IP-based code keeps
-  compiling through type inference.
+  `K: Hash + Eq + Clone`. Existing IP-based code keeps compiling through type
+  inference.
+- The `tokio` and `smol` features and their dependencies are removed, along
+  with the `ntex_ratelimiter::tokio` / `ntex_ratelimiter::smol` re-exports.
+  The background cleanup task is replaced by inline cleanup (see Changed), so
+  the crate no longer depends on an async runtime and works on every ntex
+  runtime. Previously, constructing a limiter outside a tokio runtime (e.g.
+  with ntex on neon or compio) panicked.
 - `RateLimiter::check_rate_limit` takes the key by reference
   (`&K` instead of `IpAddr`). The key is cloned only when a new bucket is
   inserted.
@@ -53,10 +59,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `X-Forwarded-For` hops may carry a port (`1.2.3.4:80`, `[::1]:80`), and
   multiple header lines are read as one list.
 - README example for limiting by API token in a handler.
-- GitHub Actions CI for the `tokio` and `smol` features.
+- GitHub Actions CI (test, clippy, doc).
 
 ### Changed
 
+- Cleanup runs inline: the first `check_rate_limit` call after each
+  `cleanup_interval` reclaims full buckets, with a CAS so only one caller per
+  interval does it. `RateLimiter::cleanup()` is public for manual scheduling.
 - `stats().active_entries` reads an atomic counter instead of locking every
   map shard.
 
@@ -83,7 +92,8 @@ RateLimiterConfig {
 };
 ```
 
-Replace `features = ["smol", "json"]` with `features = ["smol"]`.
+Remove `default-features` / `features` from the dependency; the crate has no
+features.
 
 ## [0.3.0] - 2026-07-15
 

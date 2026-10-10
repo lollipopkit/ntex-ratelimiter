@@ -8,17 +8,12 @@ A rate limiting middleware for the [ntex](https://github.com/ntex-rs/ntex) web f
 
 ## Installation
 
-- `tokio` (default): Enable Tokio runtime support
-- `smol`: Enable smol runtime support (smol is the maintained successor of async-std)
-
 ```toml
 [dependencies]
-# Default features (tokio)
 ntex-ratelimiter = "^0.4"
-
-# With smol instead of tokio
-ntex-ratelimiter = { version = "^0.4", default-features = false, features = ["smol"] }
 ```
+
+The limiter spawns no background task, so it works on every ntex runtime (tokio, compio, neon) without feature flags.
 
 ## Usage
 
@@ -135,6 +130,8 @@ Requests without a peer address (e.g. on a Unix socket listener) are charged to 
 ### Memory Safety
 
 The number of per-key buckets is bounded by `max_entries` (default `100_000`). Once the cap is reached, previously-unseen keys share a single overflow bucket (still rate-limited); keys that already have a bucket are unaffected. The overflow bucket is stored separately and is not counted toward the cap (at most `max_entries + 1` buckets). This way an attacker rotating source identifiers — whether real IPs or forged proxy headers — cannot exhaust memory. The bound is best-effort: concurrent requests may transiently exceed it by roughly the number in flight, but never unboundedly.
+
+Buckets that have refilled to full capacity hold no state and are reclaimed every `cleanup_interval` (default 5 minutes). Cleanup runs inline in the first `check_rate_limit` call after each interval, so that one request pays for one pass over the map; call `RateLimiter::cleanup()` yourself if you prefer to schedule it.
 
 ## Response Headers
 
