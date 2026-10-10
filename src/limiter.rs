@@ -55,9 +55,12 @@ impl TokenBucket {
         self.last_refill = now;
     }
 
-    /// Check if this bucket is stale (hasn't been used recently)
-    fn is_stale(&self, now: Instant, stale_threshold: Duration) -> bool {
-        now.duration_since(self.last_refill) > stale_threshold
+    /// Whether the bucket would be back at full capacity by `now`. A full
+    /// bucket behaves exactly like a missing one, so removing it loses no state.
+    fn is_full(&self, now: Instant, config: &RateLimiterConfig) -> bool {
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        let refill_rate = config.capacity as f64 / config.window as f64;
+        self.tokens + elapsed * refill_rate >= config.capacity as f64
     }
 }
 
@@ -96,8 +99,10 @@ fn compute_retry_after(tokens: f64, config: &RateLimiterConfig) -> u64 {
 pub struct RateLimiterConfig {
     pub capacity: usize,
     pub window: u64,
+    /// How often buckets that have refilled to full capacity are reclaimed.
+    /// A bucket idle for `window` seconds is always full, so memory is held
+    /// for at most about `window + cleanup_interval` after a key goes quiet.
     pub cleanup_interval: Duration,
-    pub stale_threshold: Duration,
     /// Whether to trust client-provided `X-Forwarded-For` / `X-Real-IP`
     /// headers. Defaults to `false`: only the direct peer socket address is
     /// used, which a client cannot spoof. Enable only behind a trusted proxy
@@ -129,7 +134,6 @@ impl Default for RateLimiterConfig {
             capacity: 100,
             window: 60,
             cleanup_interval: Duration::from_secs(300), // 5 minutes
-            stale_threshold: Duration::from_secs(3600), // 1 hour
             trust_proxy_headers: false,
             max_entries: 100_000,
         }
@@ -294,23 +298,22 @@ where
         }
     }
 
-    /// Clean up stale entries.
+    /// Reclaim buckets that have refilled to full capacity.
     ///
     /// Private and only ever invoked from the single task spawned by
-    /// [`start_cleanup_task`], so it unconditionally reclaims stale buckets on
+    /// [`start_cleanup_task`], so it unconditionally reclaims full buckets on
     /// each call. Scheduling relies on that task's monotonic timer rather than
     /// wall-clock time, so NTP adjustments or a drifting system clock cannot
     /// stall cleanup.
     fn cleanup(&self) {
         let now = Instant::now();
-        let stale_threshold = self.config.stale_threshold;
 
         // Count removals inside `retain` and decrement the counter by that
         // exact amount (rather than storing `map.len()`), so `fetch_add`s from
         // inserts racing with this cleanup are preserved, not clobbered.
         let mut removed = 0usize;
         self.map.retain(|_, bucket| {
-            let keep = !bucket.is_stale(now, stale_threshold);
+            let keep = !bucket.is_full(now, &self.config);
             if !keep {
                 removed += 1;
             }
@@ -850,8 +853,9 @@ mod tests {
         with_rt(|| {
             const THREADS: u32 = 8;
             const KEYS: u32 = 500;
+            // 1000 tokens/s, so drained buckets refill within milliseconds.
             let limiter = RateLimiter::<u32>::with_config(RateLimiterConfig {
-                stale_threshold: Duration::ZERO,
+                window: 1,
                 ..config(1_000, 1_000_000)
             });
 
@@ -871,12 +875,34 @@ mod tests {
             assert_eq!(limiter.map.len(), KEYS as usize);
             assert_eq!(limiter.entries.load(Ordering::Relaxed), KEYS as usize);
 
-            // With a zero stale threshold every bucket is reclaimed, and the
-            // counter must return to zero.
-            std::thread::sleep(Duration::from_millis(2));
+            // Once every bucket has refilled, cleanup reclaims all of them and
+            // the counter must return to zero.
+            std::thread::sleep(Duration::from_millis(50));
             limiter.cleanup();
             assert_eq!(limiter.map.len(), 0);
             assert_eq!(limiter.entries.load(Ordering::Relaxed), 0);
+        });
+    }
+
+    #[test]
+    fn test_cleanup_reclaims_only_full_buckets() {
+        with_rt(|| {
+            // 1 token per 6s: a drained bucket stays non-full for the test.
+            let limiter = RateLimiter::<&str>::with_config(config(10, 100));
+            limiter.check_rate_limit(&"busy");
+            limiter.cleanup();
+            assert_eq!(limiter.stats().active_entries, 1, "non-full bucket kept");
+
+            // 1000 tokens/s: refills within a millisecond.
+            let limiter = RateLimiter::<&str>::with_config(RateLimiterConfig {
+                window: 1,
+                ..config(1_000, 100)
+            });
+            limiter.check_rate_limit(&"idle");
+            std::thread::sleep(Duration::from_millis(20));
+            limiter.cleanup();
+            assert_eq!(limiter.stats().active_entries, 0, "full bucket reclaimed");
+            assert_eq!(limiter.map.len(), 0);
         });
     }
 

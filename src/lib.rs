@@ -12,7 +12,7 @@
 //! - **Spoofing-Resistant**: Defaults to the unspoofable peer socket address; `X-Forwarded-For` / `X-Real-IP` are opt-in via `trust_proxy_headers`.
 //! - **Bounded Memory**: A `max_entries` cap routes excess unseen keys to a shared overflow bucket, so rotating-IP attacks cannot exhaust memory.
 //! - **Configurable**: Capacity, time window, cleanup interval, proxy-header trust, and max entries.
-//! - **Asynchronous Cleanup**: Periodically removes stale rate limit entries to save memory.
+//! - **Asynchronous Cleanup**: Periodically removes buckets that have refilled to capacity (lossless) to save memory.
 //! - **Response Headers**: Adds `X-RateLimit-Remaining`, `X-RateLimit-Limit`, and `X-RateLimit-Reset` headers to responses, plus `Retry-After` on 429.
 //! - **Customizable Error Response**: Returns a `429 Too Many Requests` JSON response when limits are exceeded.
 //! - **Runtime Agnostic**: Supports both `tokio` (default) and `smol` runtimes via feature flags.

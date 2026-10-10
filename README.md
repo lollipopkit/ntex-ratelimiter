@@ -98,8 +98,7 @@ use std::time::Duration;
 let config = RateLimiterConfig {
     capacity: 1000,                              // 1000 requests  
     window: 3600,                               // per hour (3600 seconds)
-    cleanup_interval: Duration::from_secs(300), // cleanup every 5 minutes
-    stale_threshold: Duration::from_secs(7200), // remove entries idle for 2+ hours
+    cleanup_interval: Duration::from_secs(300), // reclaim refilled buckets every 5 minutes
     trust_proxy_headers: true,                  // trust XFF/X-Real-IP (only behind a trusted proxy)
     max_entries: 100_000,                       // cap tracked keys; overflow shares a bucket
 };
