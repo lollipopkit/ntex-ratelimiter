@@ -1,35 +1,22 @@
 use dashmap::DashMap;
 use itoa::Buffer as ItoaBuffer;
+use ipnet::IpNet;
 use ntex::http::header::{HeaderName, HeaderValue};
+use ntex::http::HeaderMap;
 use ntex::service::cfg::SharedCfg;
 use ntex::{http::StatusCode, Middleware, ServiceCtx};
-use std::net::IpAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::hash::Hash;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use ntex::{web, Service};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-#[cfg(feature = "tokio")]
-use tokio::time::interval;
-
-#[cfg(feature = "smol")]
-use smol::Timer;
-
-#[cfg(feature = "json")]
-use serde::{Deserialize, Serialize};
-
 const HEADER_RATELIMIT_REMAINING: &str = "x-ratelimit-remaining";
 const HEADER_RATELIMIT_LIMIT: &str = "x-ratelimit-limit";
 const HEADER_RATELIMIT_RESET: &str = "x-ratelimit-reset";
-
-/// Sentinel IP used as a shared bucket for previously-unseen clients once the
-/// map reaches [`RateLimiterConfig::max_entries`], so that attackers rotating
-/// source identifiers cannot exhaust memory and remain rate-limited.
-/// The unspecified address (`0.0.0.0`) is never a valid client source, and
-/// [`extract_client_ip`] rejects unspecified values parsed from proxy headers,
-/// so this sentinel never collides with an accepted client IP.
-const OVERFLOW_KEY: IpAddr = IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+const HEADER_RETRY_AFTER: &str = "retry-after";
 
 /// Token bucket algorithm implementation for rate limiting
 #[derive(Debug)]
@@ -64,16 +51,19 @@ impl TokenBucket {
         self.last_refill = now;
     }
 
-    /// Check if this bucket is stale (hasn't been used recently)
-    fn is_stale(&self, now: Instant, stale_threshold: Duration) -> bool {
-        now.duration_since(self.last_refill) > stale_threshold
+    /// Whether the bucket would be back at full capacity by `now`. A full
+    /// bucket behaves exactly like a missing one, so removing it loses no state.
+    fn is_full(&self, now: Instant, config: &RateLimiterConfig) -> bool {
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        let refill_rate = config.capacity as f64 / config.window as f64;
+        self.tokens + elapsed * refill_rate >= config.capacity as f64
     }
 }
 
 /// Compute the epoch second at which the bucket would refill back to full capacity.
 ///
 /// Kept allocation-free and independent of the bucket so it can run outside the
-/// `DashMap` shard lock (see [`RateLimiter::check_rate_limit`]).
+/// bucket lock (see [`RateLimiter::check_rate_limit`]).
 fn compute_reset_time(tokens: f64, config: &RateLimiterConfig) -> u64 {
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -88,7 +78,22 @@ fn compute_reset_time(tokens: f64, config: &RateLimiterConfig) -> u64 {
     let refill_rate = config.capacity as f64 / config.window as f64;
     let seconds_to_refill = missing_tokens / refill_rate;
 
-    now_secs + seconds_to_refill.ceil() as u64
+    // The float-to-int cast saturates, so a huge `window` cannot wrap here.
+    now_secs.saturating_add(seconds_to_refill.ceil() as u64)
+}
+
+/// `Duration` as nanoseconds, saturating (u64 nanoseconds cover ~584 years).
+fn duration_nanos(d: Duration) -> u64 {
+    u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// Seconds until the bucket holds at least one token again (`0` if it already does).
+fn compute_retry_after(tokens: f64, config: &RateLimiterConfig) -> u64 {
+    if tokens >= 1.0 {
+        return 0;
+    }
+    let refill_rate = config.capacity as f64 / config.window as f64;
+    ((1.0 - tokens) / refill_rate).ceil() as u64
 }
 
 /// Configuration for the rate limiter
@@ -96,26 +101,46 @@ fn compute_reset_time(tokens: f64, config: &RateLimiterConfig) -> u64 {
 pub struct RateLimiterConfig {
     pub capacity: usize,
     pub window: u64,
-    pub cleanup_interval: Duration,
-    pub stale_threshold: Duration,
-    /// Whether to trust client-provided `X-Forwarded-For` / `X-Real-IP`
-    /// headers. Defaults to `false`: only the direct peer socket address is
-    /// used, which a client cannot spoof. Enable only behind a trusted proxy
-    /// that overwrites (not appends to) these headers.
+    /// How often buckets that have refilled to full capacity are reclaimed.
+    /// A bucket idle for `window` seconds is always full, so memory is held
+    /// for at most about `window + cleanup_interval` after a key goes quiet.
     ///
-    /// Note the flip side of the secure default: when the app runs behind a
-    /// reverse proxy or load balancer and this stays `false`, the peer address
-    /// is the *proxy's* for every request, so all clients share one bucket and
-    /// are throttled together. Set this to `true` in that deployment.
-    pub trust_proxy_headers: bool,
-    /// Soft cap on the number of tracked client buckets. Once the live count
-    /// reaches this value, previously unseen clients share a single overflow
-    /// bucket (still rate-limited) so that an attacker cannot exhaust memory by
-    /// rotating source identifiers. The shared overflow bucket is not
-    /// additional — it counts toward this cap (occupying one of the
-    /// `max_entries` slots). The bound is best-effort: concurrent admissions
-    /// may transiently exceed it by roughly the number of in-flight requests,
-    /// but never unboundedly.
+    /// Cleanup runs inline: the first [`RateLimiter::check_rate_limit`] call
+    /// after each interval performs it (one `retain` over the map), so no
+    /// background task or async runtime is needed. Without requests the map
+    /// cannot grow, so nothing is lost by not cleaning while idle.
+    pub cleanup_interval: Duration,
+    /// Networks of reverse proxies whose `X-Forwarded-For` header is trusted.
+    ///
+    /// Empty by default: only the peer socket address is used, which a client
+    /// cannot spoof. When the peer is in one of these networks, the client IP
+    /// is the rightmost `X-Forwarded-For` hop that is not itself a trusted
+    /// proxy, so values a client prepends are ignored. If that hop is
+    /// malformed, or the header is absent, the peer address is used.
+    ///
+    /// Behind a reverse proxy or load balancer, leaving this empty means every
+    /// request carries the *proxy's* address, so all clients share one bucket.
+    ///
+    /// Only consulted by the IP-keyed [`RateLimit`] middleware.
+    pub trusted_proxies: Vec<IpNet>,
+    /// Prefix length IPv6 clients are grouped by (`0..=128`, default `64`).
+    ///
+    /// A single host is usually assigned a whole /64, so keying on the full
+    /// /128 would let one client rotate addresses to get fresh buckets and
+    /// fill `max_entries`. IPv4 addresses are always keyed individually.
+    ///
+    /// Only consulted by the IP-keyed [`RateLimit`] middleware.
+    pub ipv6_prefix_len: u8,
+    /// Soft cap on the number of per-key buckets. Once the live count reaches
+    /// this value, previously unseen keys share a single overflow bucket (still
+    /// rate-limited) so that an attacker cannot exhaust memory by rotating
+    /// identifiers; keys that already have a bucket are unaffected.
+    ///
+    /// The overflow bucket is a dedicated field that always exists and is
+    /// *not* counted toward this cap, so at most `max_entries + 1` buckets are
+    /// live. The bound is best-effort: concurrent admissions may transiently
+    /// exceed it by roughly the number of in-flight requests, but never
+    /// unboundedly.
     pub max_entries: usize,
 }
 
@@ -125,24 +150,36 @@ impl Default for RateLimiterConfig {
             capacity: 100,
             window: 60,
             cleanup_interval: Duration::from_secs(300), // 5 minutes
-            stale_threshold: Duration::from_secs(3600), // 1 hour
-            trust_proxy_headers: false,
+            trusted_proxies: Vec::new(),
+            ipv6_prefix_len: 64,
             max_entries: 100_000,
         }
     }
 }
 
-/// High-performance rate limiter using token bucket algorithm
-pub struct RateLimiter {
-    map: DashMap<IpAddr, TokenBucket>,
+/// High-performance rate limiter using token bucket algorithm.
+///
+/// `K` is the rate-limit key; it defaults to the client [`IpAddr`] used by the
+/// [`RateLimit`] middleware, but any `Hash + Eq + Clone` type works (e.g. an
+/// API token id checked by hand in a handler).
+pub struct RateLimiter<K = IpAddr> {
+    map: DashMap<K, TokenBucket>,
+    /// Shared bucket for unseen keys once `map` is full, and for requests whose
+    /// key cannot be determined. Lives outside `map`, so no sentinel key is
+    /// needed and it is never reclaimed by cleanup.
+    overflow: Mutex<TokenBucket>,
     config: RateLimiterConfig,
     /// Live-entry count for `map`, kept as a cheap stand-in for `map.len()`
     /// (which read-locks every shard): incremented when a bucket is inserted
     /// and decremented by the number reclaimed on each [`RateLimiter::cleanup`].
     entries: AtomicUsize,
+    /// Reference point for `next_cleanup`.
+    created: Instant,
+    /// Nanoseconds after `created` at which the next inline cleanup is due.
+    next_cleanup: AtomicU64,
 }
 
-impl RateLimiter {
+impl<K: Hash + Eq + Clone> RateLimiter<K> {
     /// Create a new rate limiter with default configuration
     pub fn new(capacity: usize, window: u64) -> Arc<Self> {
         let config = RateLimiterConfig {
@@ -155,125 +192,134 @@ impl RateLimiter {
 
     /// Create a new rate limiter with custom configuration
     pub fn with_config(config: RateLimiterConfig) -> Arc<Self> {
+        assert!(config.capacity > 0, "RateLimiter capacity must be greater than zero");
         assert!(config.window > 0, "RateLimiter window must be greater than zero");
+        assert!(
+            config.ipv6_prefix_len <= 128,
+            "RateLimiter ipv6_prefix_len must be at most 128"
+        );
         assert!(
             !config.cleanup_interval.is_zero(),
             "RateLimiter cleanup_interval must be greater than zero"
         );
 
-        let limiter = Arc::new(RateLimiter {
+        Arc::new(RateLimiter {
             map: DashMap::new(),
+            overflow: Mutex::new(TokenBucket::new(config.capacity)),
+            next_cleanup: AtomicU64::new(duration_nanos(config.cleanup_interval)),
             config,
             entries: AtomicUsize::new(0),
-        });
-
-        // Start periodic cleanup if a runtime is enabled
-        #[cfg(any(feature = "tokio", feature = "smol"))]
-        Self::start_cleanup_task(Arc::clone(&limiter));
-
-        limiter
-    }
-
-    #[cfg(feature = "tokio")]
-    fn start_cleanup_task(limiter: Arc<RateLimiter>) {
-        let cleanup_interval = limiter.config.cleanup_interval;
-        let weak = Arc::downgrade(&limiter);
-        tokio::spawn(async move {
-            let mut interval = interval(cleanup_interval);
-            loop {
-                interval.tick().await;
-                // Hold the limiter via a weak reference so the task exits once
-                // all strong references are gone; otherwise the task's `Arc`
-                // would keep the limiter (and its DashMap) alive forever.
-                let Some(limiter) = weak.upgrade() else {
-                    break;
-                };
-                limiter.cleanup().await;
-            }
-        });
-    }
-
-    #[cfg(feature = "smol")]
-    fn start_cleanup_task(limiter: Arc<RateLimiter>) {
-        let cleanup_interval = limiter.config.cleanup_interval;
-        let weak = Arc::downgrade(&limiter);
-        smol::spawn(async move {
-            loop {
-                Timer::after(cleanup_interval).await;
-                let Some(limiter) = weak.upgrade() else {
-                    break;
-                };
-                limiter.cleanup().await;
-            }
+            created: Instant::now(),
         })
-        .detach();
     }
 
-    /// Check rate limit for a given identifier (usually IP address)
-    pub fn check_rate_limit(&self, identifier: IpAddr) -> RateLimitResult {
+    /// Consume one token from `key`'s bucket.
+    ///
+    /// The key is only cloned when a new bucket is inserted; checks against an
+    /// existing bucket or the overflow bucket never clone it.
+    ///
+    /// Once per [`RateLimiterConfig::cleanup_interval`], one call also runs
+    /// [`RateLimiter::cleanup`] after releasing its bucket.
+    pub fn check_rate_limit(&self, key: &K) -> RateLimitResult {
         let now = Instant::now();
-        let limit = self.config.capacity;
 
-        // When the map is at capacity and this client is not already tracked,
-        // route it to a shared overflow bucket. This keeps memory bounded under
-        // a rotating-IP attack while still rate-limiting the attacker (alongside
-        // any other unseen clients). The check is best-effort: concurrent
-        // inserts may briefly exceed `max_entries`, but never unboundedly.
-        //
-        // The occupancy gate reads the `entries` atomic rather than `map.len()`
-        // (which read-locks every shard), so the common under-capacity path
-        // takes no extra lookups. Only once the map is full do we pay a single
-        // `contains_key` to tell an already-tracked client apart from a new one
-        // — exactly the path a rotating-IP flood takes, where a full `len()`
-        // scan per request would amplify the very DoS this cap defends against.
-        let key = if self.entries.load(Ordering::Relaxed) < self.config.max_entries
-            || self.map.contains_key(&identifier)
-        {
-            identifier
-        } else {
-            OVERFLOW_KEY
-        };
-
-        // Hold the shard's write guard only for the bucket mutation; the reset
-        // timestamp is computed afterwards (allocation-free) to minimize
-        // contention on the per-shard lock.
-        let (allowed, tokens) = {
-            let mut bucket = self.map.entry(key).or_insert_with(|| {
-                // Runs only when a new bucket is actually inserted, so the
-                // counter tracks real growth (including the overflow bucket,
-                // matching the previous `len()`-based accounting).
-                self.entries.fetch_add(1, Ordering::Relaxed);
-                TokenBucket::new(limit)
-            });
+        // Fast path: an existing bucket. The shard guard is dropped at the end
+        // of this statement, before any insert below can touch the same shard.
+        let hit = self.map.get_mut(key).map(|mut bucket| {
             let allowed = bucket.consume(1, now, &self.config);
             (allowed, bucket.tokens)
+        });
+
+        let (allowed, tokens) = match hit {
+            Some(hit) => hit,
+            // The occupancy gate reads the `entries` atomic rather than
+            // `map.len()` (which read-locks every shard), so a rotating-key
+            // flood costs one lookup plus the overflow lock per request. The
+            // check is best-effort: concurrent inserts may briefly exceed
+            // `max_entries`, but never unboundedly.
+            None if self.entries.load(Ordering::Relaxed) < self.config.max_entries => {
+                let mut bucket = self.map.entry(key.clone()).or_insert_with(|| {
+                    // Runs only when a bucket is actually inserted (not when a
+                    // concurrent request won the race), so the counter tracks
+                    // real growth.
+                    self.entries.fetch_add(1, Ordering::Relaxed);
+                    TokenBucket::new(self.config.capacity)
+                });
+                let allowed = bucket.consume(1, now, &self.config);
+                (allowed, bucket.tokens)
+            }
+            None => self.consume_overflow(now),
         };
 
+        // No bucket guard is held here, so `retain` cannot deadlock on it.
+        self.maybe_cleanup(now);
+        self.result(allowed, tokens)
+    }
+
+    /// Run [`RateLimiter::cleanup`] if the interval has elapsed. The CAS lets
+    /// exactly one caller per interval do it; the others return immediately.
+    fn maybe_cleanup(&self, now: Instant) {
+        let elapsed = duration_nanos(now.saturating_duration_since(self.created));
+        let due = self.next_cleanup.load(Ordering::Relaxed);
+        if elapsed < due {
+            return;
+        }
+        let next = elapsed.saturating_add(duration_nanos(self.config.cleanup_interval));
+        if self
+            .next_cleanup
+            .compare_exchange(due, next, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            self.cleanup();
+        }
+    }
+
+    /// Consume one token from the shared overflow bucket, for requests that
+    /// carry no usable key (e.g. a missing peer address).
+    fn check_overflow(&self) -> RateLimitResult {
+        let (allowed, tokens) = self.consume_overflow(Instant::now());
+        self.result(allowed, tokens)
+    }
+
+    fn consume_overflow(&self, now: Instant) -> (bool, f64) {
+        // `consume` cannot leave the bucket inconsistent, so a poisoned lock
+        // is safe to reuse.
+        let mut bucket = self.overflow.lock().unwrap_or_else(PoisonError::into_inner);
+        let allowed = bucket.consume(1, now, &self.config);
+        (allowed, bucket.tokens)
+    }
+
+    // Computed outside any bucket lock to minimize contention.
+    fn result(&self, allowed: bool, tokens: f64) -> RateLimitResult {
         RateLimitResult {
             allowed,
             remaining: tokens.floor() as u32,
             reset: compute_reset_time(tokens, &self.config),
-            limit,
+            retry_after: if allowed {
+                0
+            } else {
+                compute_retry_after(tokens, &self.config)
+            },
+            limit: self.config.capacity,
         }
     }
 
-    /// Clean up stale entries.
+    /// Reclaim buckets that have refilled to full capacity.
     ///
-    /// Private and only ever invoked from the single task spawned by
-    /// [`start_cleanup_task`], so it unconditionally reclaims stale buckets on
-    /// each call. Scheduling relies on that task's monotonic timer rather than
-    /// wall-clock time, so NTP adjustments or a drifting system clock cannot
-    /// stall cleanup.
-    async fn cleanup(&self) {
+    /// Called automatically by [`RateLimiter::check_rate_limit`] once per
+    /// [`RateLimiterConfig::cleanup_interval`]; call it directly to reclaim
+    /// memory on your own schedule. Removing a full bucket loses no state.
+    /// Scheduling uses the monotonic clock, so wall-clock adjustments cannot
+    /// stall it.
+    pub fn cleanup(&self) {
         let now = Instant::now();
-        let stale_threshold = self.config.stale_threshold;
 
         // Count removals inside `retain` and decrement the counter by that
         // exact amount (rather than storing `map.len()`), so `fetch_add`s from
         // inserts racing with this cleanup are preserved, not clobbered.
         let mut removed = 0usize;
         self.map.retain(|_, bucket| {
-            let keep = !bucket.is_stale(now, stale_threshold);
+            let keep = !bucket.is_full(now, &self.config);
             if !keep {
                 removed += 1;
             }
@@ -282,17 +328,13 @@ impl RateLimiter {
 
         if removed > 0 {
             self.entries.fetch_sub(removed, Ordering::Relaxed);
-
-            if cfg!(debug_assertions) {
-                eprintln!("Cleaned {removed} stale rate limit entries");
-            }
         }
     }
 
     /// Get current statistics
     pub fn stats(&self) -> RateLimiterStats {
         RateLimiterStats {
-            active_entries: self.map.len(),
+            active_entries: self.entries.load(Ordering::Relaxed),
             capacity: self.config.capacity,
             window: self.config.window,
         }
@@ -304,49 +346,157 @@ impl RateLimiter {
 pub struct RateLimitResult {
     pub allowed: bool,
     pub remaining: u32,
+    /// Unix timestamp (seconds) at which the bucket is full again.
     pub reset: u64,
+    /// Seconds until the next request would be allowed; `0` when `allowed`.
+    /// Suitable for a `Retry-After` header.
+    pub retry_after: u64,
     pub limit: usize,
 }
 
 /// Statistics about the rate limiter
 #[derive(Debug, Clone)]
 pub struct RateLimiterStats {
+    /// Number of per-key buckets (the shared overflow bucket is not included).
+    /// Read from a counter without locking the map, so it may be briefly off
+    /// while inserts or a cleanup are in flight.
     pub active_entries: usize,
     pub capacity: usize,
     pub window: u64,
 }
 
-/// Rate limiting middleware
-pub struct RateLimit {
-    pub limiter: Arc<RateLimiter>,
+/// Decides how [`RateLimit`] rate-limits a request.
+///
+/// Implemented for [`PeerIp`] (the default) and for any
+/// `Fn(&WebRequest<Err>) -> Option<K>` closure, see [`RateLimit::with_key`].
+pub trait KeyExtractor<K, Err> {
+    /// Check `req` against `limiter`; `None` lets the request through unchecked.
+    fn check_request(
+        &self,
+        req: &web::WebRequest<Err>,
+        limiter: &RateLimiter<K>,
+    ) -> Option<RateLimitResult>;
 }
 
-impl RateLimit {
-    pub fn new(limiter: Arc<RateLimiter>) -> Self {
-        Self { limiter }
+/// Keys requests by client IP (see [`RateLimiterConfig::trusted_proxies`]).
+///
+/// Requests without a peer address (e.g. on a Unix socket listener) share the
+/// limiter's overflow bucket, since their proxy cannot be verified. To trust
+/// a proxy on a Unix socket, use [`RateLimit::with_key`] and parse its header
+/// there.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PeerIp;
+
+impl<Err> KeyExtractor<IpAddr, Err> for PeerIp {
+    fn check_request(
+        &self,
+        req: &web::WebRequest<Err>,
+        limiter: &RateLimiter<IpAddr>,
+    ) -> Option<RateLimitResult> {
+        Some(
+            match client_ip(
+                req.peer_addr().map(|addr| addr.ip()),
+                req.headers(),
+                &limiter.config.trusted_proxies,
+            ) {
+                Some(ip) => {
+                    limiter.check_rate_limit(&ipv6_prefix(ip, limiter.config.ipv6_prefix_len))
+                }
+                None => limiter.check_overflow(),
+            },
+        )
     }
 }
 
-impl<S> Middleware<S, SharedCfg> for RateLimit {
-    type Service = RateLimitMiddlewareService<S>;
+impl<K, Err, F> KeyExtractor<K, Err> for F
+where
+    F: Fn(&web::WebRequest<Err>) -> Option<K>,
+    K: Hash + Eq + Clone,
+{
+    fn check_request(
+        &self,
+        req: &web::WebRequest<Err>,
+        limiter: &RateLimiter<K>,
+    ) -> Option<RateLimitResult> {
+        self(req).map(|key| limiter.check_rate_limit(&key))
+    }
+}
+
+/// Rate limiting middleware
+pub struct RateLimit<K = IpAddr, F = PeerIp> {
+    pub limiter: Arc<RateLimiter<K>>,
+    key: Arc<F>,
+}
+
+impl RateLimit {
+    /// Rate-limit by client IP.
+    pub fn new(limiter: Arc<RateLimiter>) -> Self {
+        Self {
+            limiter,
+            key: Arc::new(PeerIp),
+        }
+    }
+}
+
+impl<K, F> RateLimit<K, F> {
+    /// Rate-limit by a custom key derived from the request.
+    ///
+    /// Requests for which `key` returns `None` are passed through without
+    /// rate limiting and without rate-limit headers.
+    ///
+    /// `key` runs before your handler, i.e. before authentication. If it keys
+    /// on an unverified credential (such as a bearer token), every forged
+    /// value gets its own bucket and can fill `max_entries`; validate the
+    /// credential in `key`, or stack an IP-keyed [`RateLimit`] in front.
+    ///
+    /// ```rust,no_run
+    /// use ntex::web;
+    /// use ntex_ratelimiter::{RateLimit, RateLimiter};
+    ///
+    /// fn token_id(req: &web::WebRequest<web::DefaultError>) -> Option<String> {
+    ///     // Look up and validate the bearer token, return its id.
+    ///     # let _ = req; None
+    /// }
+    ///
+    /// let limiter = RateLimiter::<String>::new(60, 60);
+    /// let app = web::App::new()
+    ///     .wrap(RateLimit::with_key(limiter, token_id))
+    ///     .service(web::resource("/mcp").to(|| async { "ok" }));
+    /// ```
+    pub fn with_key<Err>(limiter: Arc<RateLimiter<K>>, key: F) -> Self
+    where
+        F: Fn(&web::WebRequest<Err>) -> Option<K>,
+    {
+        Self {
+            limiter,
+            key: Arc::new(key),
+        }
+    }
+}
+
+impl<S, K, F> Middleware<S, SharedCfg> for RateLimit<K, F> {
+    type Service = RateLimitMiddlewareService<S, K, F>;
 
     fn create(&self, service: S, _cfg: SharedCfg) -> Self::Service {
         RateLimitMiddlewareService {
             service,
             limiter: Arc::clone(&self.limiter),
+            key: Arc::clone(&self.key),
         }
     }
 }
 
-pub struct RateLimitMiddlewareService<S> {
+pub struct RateLimitMiddlewareService<S, K = IpAddr, F = PeerIp> {
     service: S,
-    limiter: Arc<RateLimiter>,
+    limiter: Arc<RateLimiter<K>>,
+    key: Arc<F>,
 }
 
-impl<S, Err> Service<web::WebRequest<Err>> for RateLimitMiddlewareService<S>
+impl<S, Err, K, F> Service<web::WebRequest<Err>> for RateLimitMiddlewareService<S, K, F>
 where
     S: Service<web::WebRequest<Err>, Response = web::WebResponse, Error = web::Error> + 'static,
     Err: web::ErrorRenderer,
+    F: KeyExtractor<K, Err>,
 {
     type Response = web::WebResponse;
     type Error = web::Error;
@@ -356,12 +506,12 @@ where
         req: web::WebRequest<Err>,
         ctx: ServiceCtx<'_, Self>,
     ) -> Result<Self::Response, Self::Error> {
-        let ip = extract_client_ip(&req, self.limiter.config.trust_proxy_headers);
-
-        let result = self.limiter.check_rate_limit(ip);
+        let Some(result) = self.key.check_request(&req, &self.limiter) else {
+            return ctx.call(&self.service, req).await;
+        };
 
         if !result.allowed {
-            return Err(RateLimitError::from(result).into());
+            return Err(RateLimitError(result).into());
         }
 
         let mut response = ctx.call(&self.service, req).await?;
@@ -373,51 +523,67 @@ where
     }
 }
 
-/// Extract client IP from request, considering proxy headers when trusted.
+/// Resolve the client IP from the peer address and, when the peer is a
+/// trusted proxy, the `X-Forwarded-For` header.
 ///
-/// When `trust_proxy_headers` is `false` (the default), proxy headers are
-/// ignored entirely and the peer socket address is used, since clients can
-/// forge `X-Forwarded-For` / `X-Real-IP` to bypass rate limiting.
-fn extract_client_ip<Err>(req: &web::WebRequest<Err>, trust_proxy_headers: bool) -> IpAddr {
-    if trust_proxy_headers {
-        // Check X-Forwarded-For header first
-        if let Some(forwarded) = req.headers().get("x-forwarded-for") {
-            if let Ok(forwarded_str) = forwarded.to_str() {
-                if let Some(ip) = forwarded_str.split(',').next() {
-                    let ip = ip.trim();
-                    if let Ok(parsed_ip) = ip.parse::<IpAddr>() {
-                        // Reject `0.0.0.0` / `::` so a forged header cannot map
-                        // a client onto the `OVERFLOW_KEY` sentinel.
-                        if !parsed_ip.is_unspecified() {
-                            return parsed_ip;
-                        }
-                    }
-                }
-            }
-        }
+/// Returns `None` without a peer address. Callers must not substitute a fixed
+/// address (e.g. `127.0.0.1`), which would merge these requests with genuine
+/// requests from that address.
+fn client_ip(peer: Option<IpAddr>, headers: &HeaderMap, trusted_proxies: &[IpNet]) -> Option<IpAddr> {
+    let peer = peer?.to_canonical();
+    let is_trusted = |ip: &IpAddr| trusted_proxies.iter().any(|net| net.contains(ip));
+    if !is_trusted(&peer) {
+        return Some(peer);
+    }
+    Some(forwarded_for(headers, is_trusted).unwrap_or(peer))
+}
 
-        // Check X-Real-IP header
-        if let Some(real_ip) = req.headers().get("x-real-ip") {
-            if let Ok(ip_str) = real_ip.to_str() {
-                let ip = ip_str.trim();
-                if let Ok(parsed_ip) = ip.parse::<IpAddr>() {
-                    if !parsed_ip.is_unspecified() {
-                        return parsed_ip;
-                    }
-                }
+/// The rightmost `X-Forwarded-For` hop that is not a trusted proxy (the hop
+/// our nearest untrusted neighbour connected from), or the leftmost hop if all
+/// are trusted. `None` if that hop is malformed or the header is absent.
+///
+/// Scans forward over all header lines in order, so no allocation is needed.
+fn forwarded_for(headers: &HeaderMap, is_trusted: impl Fn(&IpAddr) -> bool) -> Option<IpAddr> {
+    // `Some(None)` marks a malformed hop.
+    let mut leftmost: Option<Option<IpAddr>> = None;
+    let mut untrusted: Option<Option<IpAddr>> = None;
+    for value in headers.get_all("x-forwarded-for") {
+        let Ok(value) = value.to_str() else {
+            untrusted = Some(None);
+            continue;
+        };
+        for hop in value.split(',') {
+            let hop = parse_hop(hop.trim());
+            leftmost.get_or_insert(hop);
+            if !hop.is_some_and(|ip| is_trusted(&ip)) {
+                untrusted = Some(hop);
             }
         }
     }
+    untrusted.or(leftmost).flatten()
+}
 
-    // Fallback to the actual peer socket address. This is allocation-free
-    // (no string round-trip through `connection_info()`) and cannot be
-    // spoofed by the client.
-    if let Some(peer) = req.peer_addr() {
-        return peer.ip();
+/// Truncate an IPv6 address to its first `len` bits; IPv4 is returned as is.
+fn ipv6_prefix(ip: IpAddr, len: u8) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => {
+            // `checked_shl(128)` is `None`, i.e. a /0 prefix masks everything.
+            let mask = u128::MAX.checked_shl(128 - u32::from(len)).unwrap_or(0);
+            IpAddr::V6((u128::from(v6) & mask).into())
+        }
+        IpAddr::V4(_) => ip,
     }
+}
 
-    // Default to localhost if all else fails
-    IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1))
+/// Parse an `X-Forwarded-For` hop, accepting an optional port
+/// (`1.2.3.4:80`, `[::1]:80`). `0.0.0.0` / `::` is never a valid client.
+fn parse_hop(hop: &str) -> Option<IpAddr> {
+    let ip = hop
+        .parse::<IpAddr>()
+        .or_else(|_| hop.parse::<SocketAddr>().map(|addr| addr.ip()))
+        .ok()?
+        .to_canonical();
+    (!ip.is_unspecified()).then_some(ip)
 }
 
 /// Add rate limit headers to response
@@ -437,80 +603,36 @@ fn add_rate_limit_headers(headers: &mut ntex::http::HeaderMap, result: &RateLimi
     }
 }
 
-/// Rate limit error response
+/// Error returned by the middleware when a request is rate-limited.
 #[derive(Debug)]
-#[cfg_attr(feature = "json", derive(Serialize, Deserialize))]
-struct RateLimitErrorData {
-    remaining: u32,
-    reset: u64,
-    limit: usize,
-}
-
-/// Wrapper struct used only when serializing the JSON error body.
-#[cfg(feature = "json")]
-#[derive(Debug, Serialize, Deserialize)]
-struct RateLimitErrorResponse {
-    code: u32,
-    message: String,
-    data: RateLimitErrorData,
-}
-
-#[derive(Debug)]
-struct RateLimitError {
-    data: RateLimitErrorData,
-}
-
-impl From<RateLimitResult> for RateLimitError {
-    fn from(result: RateLimitResult) -> Self {
-        Self {
-            data: RateLimitErrorData {
-                remaining: result.remaining,
-                reset: result.reset,
-                limit: result.limit,
-            },
-        }
-    }
-}
+struct RateLimitError(RateLimitResult);
 
 impl std::fmt::Display for RateLimitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
             "Rate limit exceeded. Remaining: {}, Reset: {}, Limit: {}",
-            self.data.remaining, self.data.reset, self.data.limit
+            self.0.remaining, self.0.reset, self.0.limit
         )
     }
 }
 
 impl web::error::WebResponseError for RateLimitError {
     fn error_response(&self, _: &ntex::web::HttpRequest) -> web::HttpResponse {
-        #[cfg(feature = "json")]
-        let body = {
-            let error_response = RateLimitErrorResponse {
-                code: 429,
-                message: "Rate limit exceeded".to_string(),
-                data: RateLimitErrorData {
-                    remaining: self.data.remaining,
-                    reset: self.data.reset,
-                    limit: self.data.limit,
-                },
-            };
-            serde_json::to_string(&error_response)
-                .unwrap_or_else(|_| r#"{"code":429,"message":"Rate limit exceeded"}"#.to_string())
-        };
-
-        #[cfg(not(feature = "json"))]
+        let r = &self.0;
+        // Only integers are interpolated, so no JSON escaping is needed.
         let body = format!(
             r#"{{"code":429,"message":"Rate limit exceeded","data":{{"remaining":{},"reset":{},"limit":{}}}}}"#,
-            self.data.remaining, self.data.reset, self.data.limit
+            r.remaining, r.reset, r.limit
         );
 
         let mut buf = ItoaBuffer::new();
         web::HttpResponse::build(StatusCode::TOO_MANY_REQUESTS)
             .set_header("content-type", "application/json")
-            .set_header(HEADER_RATELIMIT_REMAINING, buf.format(self.data.remaining))
-            .set_header(HEADER_RATELIMIT_LIMIT, buf.format(self.data.limit))
-            .set_header(HEADER_RATELIMIT_RESET, buf.format(self.data.reset))
+            .set_header(HEADER_RATELIMIT_REMAINING, buf.format(r.remaining))
+            .set_header(HEADER_RATELIMIT_LIMIT, buf.format(r.limit))
+            .set_header(HEADER_RATELIMIT_RESET, buf.format(r.reset))
+            .set_header(HEADER_RETRY_AFTER, buf.format(r.retry_after))
             .body(body)
     }
 }
@@ -518,6 +640,7 @@ impl web::error::WebResponseError for RateLimitError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ntex::web::test::TestRequest;
 
     #[test]
     fn test_token_bucket_basic() {
@@ -567,34 +690,49 @@ mod tests {
         assert!(!bucket.consume(1, later, &config));
     }
 
-    // The rate-limit checks themselves are synchronous (`check_rate_limit` does
-    // not await), so the assertion logic is shared between runtimes. Only the
-    // `RateLimiter` construction needs a runtime, because it spawns the cleanup
-    // task. Each runtime therefore gets a thin wrapper that drives a runtime
-    // context around the shared checks.
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
 
-    fn check_capacity_5(limiter: &RateLimiter) {
-        let ip = "192.168.1.1".parse::<IpAddr>().unwrap();
+    fn config(capacity: usize, max_entries: usize) -> RateLimiterConfig {
+        RateLimiterConfig {
+            capacity,
+            window: 60,
+            max_entries,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_rate_limiter() {
+        let limiter = RateLimiter::with_config(RateLimiterConfig {
+            capacity: 5,
+            window: 1,
+            ..Default::default()
+        });
+        let ip = ip("192.168.1.1");
 
         // Should allow up to capacity
         for i in 0..5 {
-            let result = limiter.check_rate_limit(ip);
+            let result = limiter.check_rate_limit(&ip);
             assert!(result.allowed, "Request {} should be allowed", i + 1);
             assert_eq!(result.remaining, 4 - i as u32);
+            assert_eq!(result.retry_after, 0);
         }
 
         // Should deny when capacity exceeded
-        let result = limiter.check_rate_limit(ip);
+        let result = limiter.check_rate_limit(&ip);
         assert!(!result.allowed);
         assert_eq!(result.remaining, 0);
+        assert_eq!(result.retry_after, 1);
     }
 
-    fn check_different_ips(limiter: &RateLimiter) {
+    #[test]
+    fn test_rate_limiter_different_ips() {
         // Different IPs should have separate limits
-        let ip1 = "192.168.1.1".parse::<IpAddr>().unwrap();
-        let ip2 = "192.168.1.2".parse::<IpAddr>().unwrap();
-        let result1 = limiter.check_rate_limit(ip1);
-        let result2 = limiter.check_rate_limit(ip2);
+        let limiter = RateLimiter::new(2, 60);
+        let result1 = limiter.check_rate_limit(&ip("192.168.1.1"));
+        let result2 = limiter.check_rate_limit(&ip("192.168.1.2"));
 
         assert!(result1.allowed);
         assert!(result2.allowed);
@@ -602,159 +740,385 @@ mod tests {
         assert_eq!(result2.remaining, 1);
     }
 
-    #[cfg(feature = "tokio")]
-    #[tokio::test]
-    async fn test_rate_limiter() {
-        let limiter = RateLimiter::with_config(RateLimiterConfig {
-            capacity: 5,
-            window: 1,
-            ..Default::default()
-        });
-        check_capacity_5(&limiter);
-    }
-
-    #[cfg(feature = "tokio")]
-    #[tokio::test]
-    async fn test_rate_limiter_different_ips() {
-        let limiter = RateLimiter::new(2, 60);
-        check_different_ips(&limiter);
-    }
-
-    #[cfg(feature = "smol")]
     #[test]
-    fn test_rate_limiter() {
-        smol::block_on(async {
-            let limiter = RateLimiter::with_config(RateLimiterConfig {
-                capacity: 5,
-                window: 1,
-                ..Default::default()
-            });
-            check_capacity_5(&limiter);
-        });
+    fn test_string_keys_independent() {
+        let limiter = RateLimiter::<String>::new(2, 60);
+        let a = "token-a".to_string();
+        let b = "token-b".to_string();
+
+        assert!(limiter.check_rate_limit(&a).allowed);
+        assert!(limiter.check_rate_limit(&a).allowed);
+        assert!(!limiter.check_rate_limit(&a).allowed);
+
+        let result = limiter.check_rate_limit(&b);
+        assert!(result.allowed, "token-b must not share token-a's bucket");
+        assert_eq!(result.remaining, 1);
+        assert_eq!(limiter.stats().active_entries, 2);
     }
 
-    #[cfg(feature = "smol")]
     #[test]
-    fn test_rate_limiter_different_ips() {
-        smol::block_on(async {
-            let limiter = RateLimiter::new(2, 60);
-            check_different_ips(&limiter);
-        });
-    }
-
-    // Caller must configure the limiter with capacity=1, max_entries=2.
-    fn check_overflow_routing(limiter: &RateLimiter) {
-        let ip1 = "10.0.0.1".parse::<IpAddr>().unwrap();
-        let ip2 = "10.0.0.2".parse::<IpAddr>().unwrap();
-        let ip3 = "10.0.0.3".parse::<IpAddr>().unwrap();
-        let ip4 = "10.0.0.4".parse::<IpAddr>().unwrap();
+    fn test_overflow_bucket() {
+        let limiter = RateLimiter::with_config(config(1, 2));
+        let (ip1, ip2) = (ip("10.0.0.1"), ip("10.0.0.2"));
 
         // ip1 and ip2 each get their own bucket (capacity 1).
-        assert!(limiter.check_rate_limit(ip1).allowed);
-        assert!(limiter.check_rate_limit(ip2).allowed);
+        assert!(limiter.check_rate_limit(&ip1).allowed);
+        assert!(limiter.check_rate_limit(&ip2).allowed);
 
         // Map is at capacity; unseen ip3 is routed to the overflow bucket,
         // which is fresh (capacity 1) -> allowed.
         assert!(
-            limiter.check_rate_limit(ip3).allowed,
+            limiter.check_rate_limit(&ip("10.0.0.3")).allowed,
             "first overflow hit should be allowed"
         );
         // ip4 is unseen but shares the now-empty overflow bucket -> denied.
         assert!(
-            !limiter.check_rate_limit(ip4).allowed,
+            !limiter.check_rate_limit(&ip("10.0.0.4")).allowed,
             "second overflow hit should be denied"
         );
 
-        // No per-IP buckets were created for ip3/ip4; only the overflow bucket.
-        assert!(limiter.map.len() <= 3);
+        // The overflow bucket is not part of the map.
+        assert_eq!(limiter.map.len(), 2);
+        assert_eq!(limiter.entries.load(Ordering::Relaxed), 2);
     }
 
-    #[cfg(feature = "tokio")]
-    #[tokio::test]
-    async fn test_overflow_bucket() {
-        let limiter = RateLimiter::with_config(RateLimiterConfig {
-            capacity: 1,
-            window: 60,
-            max_entries: 2,
-            ..Default::default()
-        });
-        check_overflow_routing(&limiter);
-    }
-
-    #[cfg(feature = "smol")]
     #[test]
-    fn test_overflow_bucket() {
-        smol::block_on(async {
-            let limiter = RateLimiter::with_config(RateLimiterConfig {
-                capacity: 1,
-                window: 60,
-                max_entries: 2,
-                ..Default::default()
-            });
-            check_overflow_routing(&limiter);
+    fn test_overflow_leaves_existing_keys_alone() {
+        let limiter = RateLimiter::<String>::with_config(config(2, 1));
+        let known = "known".to_string();
+
+        assert!(limiter.check_rate_limit(&known).allowed);
+
+        // Exhaust the overflow bucket with unseen keys.
+        assert!(limiter.check_rate_limit(&"new-1".to_string()).allowed);
+        assert!(limiter.check_rate_limit(&"new-2".to_string()).allowed);
+        assert!(!limiter.check_rate_limit(&"new-3".to_string()).allowed);
+
+        // The tracked key keeps its own bucket.
+        let result = limiter.check_rate_limit(&known);
+        assert!(result.allowed);
+        assert_eq!(result.remaining, 0);
+        assert_eq!(limiter.stats().active_entries, 1);
+    }
+
+    /// Key whose `Clone` impl counts invocations; identity is `id` only.
+    struct CountingKey {
+        id: u32,
+        clones: Arc<AtomicUsize>,
+    }
+
+    impl Clone for CountingKey {
+        fn clone(&self) -> Self {
+            self.clones.fetch_add(1, Ordering::Relaxed);
+            Self {
+                id: self.id,
+                clones: Arc::clone(&self.clones),
+            }
+        }
+    }
+
+    impl PartialEq for CountingKey {
+        fn eq(&self, other: &Self) -> bool {
+            self.id == other.id
+        }
+    }
+
+    impl Eq for CountingKey {}
+
+    impl Hash for CountingKey {
+        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+            self.id.hash(state);
+        }
+    }
+
+    #[test]
+    fn test_check_clones_only_on_insert() {
+        let clones = Arc::new(AtomicUsize::new(0));
+        let key = |id| CountingKey {
+            id,
+            clones: Arc::clone(&clones),
+        };
+        let limiter = RateLimiter::with_config(config(10, 1));
+        let (a, b) = (key(1), key(2));
+
+        limiter.check_rate_limit(&a);
+        assert_eq!(clones.load(Ordering::Relaxed), 1, "insert clones once");
+
+        for _ in 0..5 {
+            limiter.check_rate_limit(&a);
+        }
+        assert_eq!(clones.load(Ordering::Relaxed), 1, "existing bucket: no clone");
+
+        // Map is full, so `b` goes to the overflow bucket without a clone.
+        limiter.check_rate_limit(&b);
+        assert_eq!(clones.load(Ordering::Relaxed), 1, "overflow: no clone");
+    }
+
+    #[test]
+    fn test_concurrent_entries_do_not_drift() {
+        const THREADS: u32 = 8;
+        const KEYS: u32 = 500;
+        // 1000 tokens/s, so drained buckets refill within milliseconds.
+        let limiter = RateLimiter::<u32>::with_config(RateLimiterConfig {
+            window: 1,
+            ..config(1_000, 1_000_000)
         });
+
+        std::thread::scope(|s| {
+            for t in 0..THREADS {
+                let limiter = &limiter;
+                s.spawn(move || {
+                    // Overlapping key ranges force racing inserts of the
+                    // same key across threads.
+                    for k in 0..KEYS {
+                        limiter.check_rate_limit(&((k + t * 7) % KEYS));
+                    }
+                });
+            }
+        });
+
+        assert_eq!(limiter.map.len(), KEYS as usize);
+        assert_eq!(limiter.entries.load(Ordering::Relaxed), KEYS as usize);
+
+        // Once every bucket has refilled, cleanup reclaims all of them and
+        // the counter must return to zero.
+        std::thread::sleep(Duration::from_millis(50));
+        limiter.cleanup();
+        assert_eq!(limiter.map.len(), 0);
+        assert_eq!(limiter.entries.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_cleanup_reclaims_only_full_buckets() {
+        // 1 token per 6s: a drained bucket stays non-full for the test.
+        let limiter = RateLimiter::<&str>::with_config(config(10, 100));
+        limiter.check_rate_limit(&"busy");
+        limiter.cleanup();
+        assert_eq!(limiter.stats().active_entries, 1, "non-full bucket kept");
+
+        // 1000 tokens/s: refills within a millisecond.
+        let limiter = RateLimiter::<&str>::with_config(RateLimiterConfig {
+            window: 1,
+            ..config(1_000, 100)
+        });
+        limiter.check_rate_limit(&"idle");
+        std::thread::sleep(Duration::from_millis(20));
+        limiter.cleanup();
+        assert_eq!(limiter.stats().active_entries, 0, "full bucket reclaimed");
+        assert_eq!(limiter.map.len(), 0);
+    }
+
+    #[test]
+    fn test_inline_cleanup() {
+        // 10 tokens/s: a used bucket needs 100ms to refill.
+        let limiter = RateLimiter::<&str>::with_config(RateLimiterConfig {
+            window: 1,
+            cleanup_interval: Duration::from_millis(50),
+            ..config(10, 100)
+        });
+        limiter.check_rate_limit(&"a");
+        assert_eq!(limiter.stats().active_entries, 1, "not due yet");
+
+        // After 150ms "a" is full and cleanup is due: the next check reclaims
+        // "a" but keeps the bucket it just drained.
+        std::thread::sleep(Duration::from_millis(150));
+        limiter.check_rate_limit(&"b");
+        assert!(!limiter.map.contains_key(&"a"));
+        assert!(limiter.map.contains_key(&"b"));
+        assert_eq!(limiter.stats().active_entries, 1);
+    }
+
+    #[test]
+    fn test_inline_cleanup_runs_once_per_interval() {
+        let limiter = RateLimiter::<u32>::with_config(RateLimiterConfig {
+            cleanup_interval: Duration::from_millis(20),
+            ..config(10, 100)
+        });
+        std::thread::sleep(Duration::from_millis(30));
+        let due = limiter.next_cleanup.load(Ordering::Relaxed);
+
+        // Many concurrent callers past the deadline advance it exactly once.
+        std::thread::scope(|s| {
+            for k in 0..8 {
+                let limiter = &limiter;
+                s.spawn(move || limiter.check_rate_limit(&k));
+            }
+        });
+        let next = limiter.next_cleanup.load(Ordering::Relaxed);
+        assert!(next > due);
+        assert!(next - due < duration_nanos(Duration::from_millis(20)) * 2);
+    }
+
+    #[test]
+    fn test_unknown_peer_uses_overflow_bucket() {
+        let limiter = RateLimiter::with_config(config(1, 100));
+        let localhost = ip("127.0.0.1");
+
+        // Test requests carry no peer address.
+        let req = TestRequest::default().to_srv_request();
+        let result = PeerIp.check_request(&req, &limiter).unwrap();
+        assert!(result.allowed);
+        assert!(
+            !PeerIp.check_request(&req, &limiter).unwrap().allowed,
+            "unknown peers share the overflow bucket"
+        );
+
+        // No per-IP bucket was created, so genuine localhost is unaffected.
+        assert_eq!(limiter.stats().active_entries, 0);
+        assert!(limiter.check_rate_limit(&localhost).allowed);
+        assert_eq!(limiter.stats().active_entries, 1);
+    }
+
+    #[test]
+    fn test_custom_key_extractor() {
+        let limiter = RateLimiter::<String>::new(1, 60);
+        let key = |req: &web::WebRequest<web::DefaultError>| {
+            req.headers()
+                .get("x-api-token")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        };
+        let mw = RateLimit::with_key(Arc::clone(&limiter), key);
+
+        let with_token = || {
+            TestRequest::default()
+                .header("x-api-token", "t1")
+                .to_srv_request()
+        };
+        assert!(mw.key.check_request(&with_token(), &limiter).unwrap().allowed);
+        assert!(!mw.key.check_request(&with_token(), &limiter).unwrap().allowed);
+
+        // No key -> not rate-limited.
+        let req = TestRequest::default().to_srv_request();
+        assert!(mw.key.check_request(&req, &limiter).is_none());
+    }
+
+    #[test]
+    fn test_error_response() {
+        use ntex::web::error::WebResponseError;
+
+        let err = RateLimitError(RateLimitResult {
+            allowed: false,
+            remaining: 0,
+            reset: 1_700_000_000,
+            retry_after: 3,
+            limit: 100,
+        });
+        let res = err.error_response(&TestRequest::default().to_http_request());
+        assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let header = |name| res.headers().get(name).unwrap().to_str().unwrap();
+        assert_eq!(header(HEADER_RETRY_AFTER), "3");
+        assert_eq!(header(HEADER_RATELIMIT_REMAINING), "0");
+        assert_eq!(header(HEADER_RATELIMIT_LIMIT), "100");
+        assert_eq!(header(HEADER_RATELIMIT_RESET), "1700000000");
+        assert_eq!(header("content-type"), "application/json");
+
+        let body = match res.body() {
+            ntex::http::body::ResponseBody::Body(ntex::http::body::Body::Bytes(b)) => b.clone(),
+            other => panic!("unexpected body: {other:?}"),
+        };
+        assert_eq!(
+            &body[..],
+            br#"{"code":429,"message":"Rate limit exceeded","data":{"remaining":0,"reset":1700000000,"limit":100}}"#
+        );
     }
 
     #[test]
     #[should_panic(expected = "cleanup_interval must be greater than zero")]
     fn test_zero_cleanup_interval_rejected() {
-        // The assertion fires before the cleanup task is spawned, so no runtime
-        // is needed and both the tokio and smol paths are covered.
-        let _ = RateLimiter::with_config(RateLimiterConfig {
+        let _ = RateLimiter::<IpAddr>::with_config(RateLimiterConfig {
             cleanup_interval: Duration::ZERO,
             ..Default::default()
         });
     }
 
     #[test]
-    fn test_extract_client_ip_trust_proxy() {
-        use ntex::web::test::TestRequest;
+    fn test_ipv6_prefix() {
+        let v6 = ip("2001:db8:1:2:3:4:5:6");
+        assert_eq!(ipv6_prefix(v6, 64), ip("2001:db8:1:2::"));
+        assert_eq!(ipv6_prefix(v6, 48), ip("2001:db8:1::"));
+        assert_eq!(ipv6_prefix(v6, 128), v6);
+        assert_eq!(ipv6_prefix(v6, 0), ip("::"));
+        assert_eq!(ipv6_prefix(ip("1.2.3.4"), 0), ip("1.2.3.4"));
+    }
 
-        // Trusted: X-Forwarded-For is honored.
+    #[test]
+    #[should_panic(expected = "ipv6_prefix_len must be at most 128")]
+    fn test_ipv6_prefix_len_rejected() {
+        let _ = RateLimiter::<IpAddr>::with_config(RateLimiterConfig {
+            ipv6_prefix_len: 129,
+            ..Default::default()
+        });
+    }
+
+    #[test]
+    fn test_huge_window_does_not_overflow() {
+        let limiter = RateLimiter::<u32>::new(1, u64::MAX);
+        assert!(limiter.check_rate_limit(&1).allowed);
+        let result = limiter.check_rate_limit(&1);
+        assert!(!result.allowed);
+        assert_eq!(result.reset, u64::MAX);
+        assert_eq!(result.retry_after, u64::MAX);
+    }
+
+    #[test]
+    #[should_panic(expected = "capacity must be greater than zero")]
+    fn test_zero_capacity_rejected() {
+        let _ = RateLimiter::<IpAddr>::new(0, 60);
+    }
+
+    #[test]
+    fn test_client_ip() {
+        let trusted: Vec<IpNet> = vec!["10.0.0.0/8".parse().unwrap(), "fd00::/8".parse().unwrap()];
+        let proxy = Some(ip("10.0.0.1"));
+        let resolve = |peer, xff: &[&str]| {
+            let req = xff
+                .iter()
+                .fold(TestRequest::default(), |req, v| req.header("x-forwarded-for", *v))
+                .header("x-real-ip", "7.7.7.7")
+                .to_srv_request();
+            client_ip(peer, req.headers(), &trusted)
+        };
+
+        // No peer address: unknown.
+        assert_eq!(resolve(None, &["1.2.3.4"]), None);
+        // Untrusted peer: headers are ignored.
+        assert_eq!(resolve(Some(ip("8.8.8.8")), &["1.2.3.4"]), Some(ip("8.8.8.8")));
+        // Trusted peer without XFF: the proxy itself (X-Real-IP is never used).
+        assert_eq!(resolve(proxy, &[]), proxy);
+        // Client-prepended values are skipped: rightmost untrusted hop wins.
+        assert_eq!(resolve(proxy, &["6.6.6.6, 1.2.3.4"]), Some(ip("1.2.3.4")));
+        assert_eq!(
+            resolve(proxy, &["6.6.6.6, 1.2.3.4, 10.0.0.2"]),
+            Some(ip("1.2.3.4"))
+        );
+        // Multiple header lines are one list, in order.
+        assert_eq!(
+            resolve(proxy, &["6.6.6.6", "1.2.3.4", "10.0.0.2"]),
+            Some(ip("1.2.3.4"))
+        );
+        // All hops trusted: the leftmost one.
+        assert_eq!(resolve(proxy, &["10.0.0.3, 10.0.0.2"]), Some(ip("10.0.0.3")));
+        // Malformed or unspecified rightmost untrusted hop: fall back to peer.
+        assert_eq!(resolve(proxy, &["1.2.3.4, garbage"]), proxy);
+        assert_eq!(resolve(proxy, &["1.2.3.4, 0.0.0.0"]), proxy);
+        assert_eq!(resolve(proxy, &["1.2.3.4,,10.0.0.2"]), proxy);
+        // Ports are accepted.
+        assert_eq!(resolve(proxy, &["1.2.3.4:5678"]), Some(ip("1.2.3.4")));
+        assert_eq!(resolve(proxy, &["[2001:db8::1]:80"]), Some(ip("2001:db8::1")));
+        // IPv4-mapped IPv6 peers and hops are canonicalized.
+        assert_eq!(
+            resolve(Some(ip("::ffff:10.0.0.1")), &["::ffff:1.2.3.4"]),
+            Some(ip("1.2.3.4"))
+        );
+        assert_eq!(resolve(Some(ip("::ffff:8.8.8.8")), &[]), Some(ip("8.8.8.8")));
+        // IPv6 trusted proxy.
+        assert_eq!(resolve(Some(ip("fd00::1")), &["2001:db8::2"]), Some(ip("2001:db8::2")));
+        // No trusted proxies configured: always the peer.
         let req = TestRequest::default()
             .header("x-forwarded-for", "1.2.3.4")
             .to_srv_request();
-        assert_eq!(
-            extract_client_ip(&req, true),
-            "1.2.3.4".parse::<IpAddr>().unwrap()
-        );
-
-        // Untrusted (default): XFF is ignored; test requests have no peer
-        // address, so we fall back to localhost.
-        let req = TestRequest::default()
-            .header("x-forwarded-for", "1.2.3.4")
-            .to_srv_request();
-        assert_eq!(
-            extract_client_ip(&req, false),
-            "127.0.0.1".parse::<IpAddr>().unwrap()
-        );
-
-        // Trusted: X-Real-IP is honored.
-        let req = TestRequest::default()
-            .header("x-real-ip", "5.6.7.8")
-            .to_srv_request();
-        assert_eq!(
-            extract_client_ip(&req, true),
-            "5.6.7.8".parse::<IpAddr>().unwrap()
-        );
-
-        // Trusted but malformed header -> falls back to peer / localhost.
-        let req = TestRequest::default()
-            .header("x-forwarded-for", "not-an-ip")
-            .to_srv_request();
-        assert_eq!(
-            extract_client_ip(&req, true),
-            "127.0.0.1".parse::<IpAddr>().unwrap()
-        );
-
-        // Trusted but unspecified (`0.0.0.0`) header -> rejected, falls back to
-        // peer / localhost, so a client cannot map itself onto OVERFLOW_KEY.
-        let req = TestRequest::default()
-            .header("x-forwarded-for", "0.0.0.0")
-            .to_srv_request();
-        assert_eq!(
-            extract_client_ip(&req, true),
-            "127.0.0.1".parse::<IpAddr>().unwrap()
-        );
+        assert_eq!(client_ip(proxy, req.headers(), &[]), proxy);
     }
 }
