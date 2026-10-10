@@ -100,6 +100,7 @@ let config = RateLimiterConfig {
     window: 3600,                               // per hour (3600 seconds)
     cleanup_interval: Duration::from_secs(300), // reclaim refilled buckets every 5 minutes
     trusted_proxies: vec!["10.0.0.0/8".parse().unwrap()], // read XFF only from these peers
+    ipv6_prefix_len: 64,                        // group IPv6 clients by /64
     max_entries: 100_000,                       // cap tracked keys; overflow shares a bucket
 };
 
@@ -125,7 +126,7 @@ By default the middleware uses only the **peer socket address**, which the clien
 
 Behind a reverse proxy or load balancer, list its networks in `RateLimiterConfig::trusted_proxies` (`IpNet`, re-exported by this crate). When the peer is in one of them, the client IP is the **rightmost** `X-Forwarded-For` hop that is not itself a trusted proxy. Values a client prepends to the header are therefore ignored, which works with proxies that append to the header (e.g. nginx `$proxy_add_x_forwarded_for`). Multiple `X-Forwarded-For` header lines are read as one list, and hops may carry a port (`1.2.3.4:80`, `[::1]:80`). If that hop is malformed or the header is absent, the peer address is used. `X-Real-IP` is not used.
 
-IPv4-mapped IPv6 addresses (`::ffff:1.2.3.4`) are normalized to IPv4.
+IPv4-mapped IPv6 addresses (`::ffff:1.2.3.4`) are normalized to IPv4. IPv6 clients are grouped by `ipv6_prefix_len` (default `/64`), since a single host usually owns a whole /64 and could otherwise rotate addresses to get fresh buckets.
 
 Requests without a peer address (e.g. on a Unix socket listener) are charged to the shared overflow bucket rather than to a fixed address such as `127.0.0.1`, because their proxy cannot be verified. To trust a proxy on a Unix socket, parse its header in `RateLimit::with_key`.
 

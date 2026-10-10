@@ -118,6 +118,14 @@ pub struct RateLimiterConfig {
     ///
     /// Only consulted by the IP-keyed [`RateLimit`] middleware.
     pub trusted_proxies: Vec<IpNet>,
+    /// Prefix length IPv6 clients are grouped by (`0..=128`, default `64`).
+    ///
+    /// A single host is usually assigned a whole /64, so keying on the full
+    /// /128 would let one client rotate addresses to get fresh buckets and
+    /// fill `max_entries`. IPv4 addresses are always keyed individually.
+    ///
+    /// Only consulted by the IP-keyed [`RateLimit`] middleware.
+    pub ipv6_prefix_len: u8,
     /// Soft cap on the number of per-key buckets. Once the live count reaches
     /// this value, previously unseen keys share a single overflow bucket (still
     /// rate-limited) so that an attacker cannot exhaust memory by rotating
@@ -138,6 +146,7 @@ impl Default for RateLimiterConfig {
             window: 60,
             cleanup_interval: Duration::from_secs(300), // 5 minutes
             trusted_proxies: Vec::new(),
+            ipv6_prefix_len: 64,
             max_entries: 100_000,
         }
     }
@@ -179,6 +188,10 @@ where
     pub fn with_config(config: RateLimiterConfig) -> Arc<Self> {
         assert!(config.capacity > 0, "RateLimiter capacity must be greater than zero");
         assert!(config.window > 0, "RateLimiter window must be greater than zero");
+        assert!(
+            config.ipv6_prefix_len <= 128,
+            "RateLimiter ipv6_prefix_len must be at most 128"
+        );
         assert!(
             !config.cleanup_interval.is_zero(),
             "RateLimiter cleanup_interval must be greater than zero"
@@ -396,7 +409,9 @@ impl<Err> KeyExtractor<IpAddr, Err> for PeerIp {
                 req.headers(),
                 &limiter.config.trusted_proxies,
             ) {
-                Some(ip) => limiter.check_rate_limit(&ip),
+                Some(ip) => {
+                    limiter.check_rate_limit(&ipv6_prefix(ip, limiter.config.ipv6_prefix_len))
+                }
                 None => limiter.check_overflow(),
             },
         )
@@ -556,6 +571,18 @@ fn forwarded_for(headers: &HeaderMap, is_trusted: impl Fn(&IpAddr) -> bool) -> O
         }
     }
     untrusted.or(leftmost).flatten()
+}
+
+/// Truncate an IPv6 address to its first `len` bits; IPv4 is returned as is.
+fn ipv6_prefix(ip: IpAddr, len: u8) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => {
+            // `checked_shl(128)` is `None`, i.e. a /0 prefix masks everything.
+            let mask = u128::MAX.checked_shl(128 - u32::from(len)).unwrap_or(0);
+            IpAddr::V6((u128::from(v6) & mask).into())
+        }
+        IpAddr::V4(_) => ip,
+    }
 }
 
 /// Parse an `X-Forwarded-For` hop, accepting an optional port
@@ -1009,6 +1036,25 @@ mod tests {
         // is needed and both the tokio and smol paths are covered.
         let _ = RateLimiter::<IpAddr>::with_config(RateLimiterConfig {
             cleanup_interval: Duration::ZERO,
+            ..Default::default()
+        });
+    }
+
+    #[test]
+    fn test_ipv6_prefix() {
+        let v6 = ip("2001:db8:1:2:3:4:5:6");
+        assert_eq!(ipv6_prefix(v6, 64), ip("2001:db8:1:2::"));
+        assert_eq!(ipv6_prefix(v6, 48), ip("2001:db8:1::"));
+        assert_eq!(ipv6_prefix(v6, 128), v6);
+        assert_eq!(ipv6_prefix(v6, 0), ip("::"));
+        assert_eq!(ipv6_prefix(ip("1.2.3.4"), 0), ip("1.2.3.4"));
+    }
+
+    #[test]
+    #[should_panic(expected = "ipv6_prefix_len must be at most 128")]
+    fn test_ipv6_prefix_len_rejected() {
+        let _ = RateLimiter::<IpAddr>::with_config(RateLimiterConfig {
+            ipv6_prefix_len: 129,
             ..Default::default()
         });
     }
