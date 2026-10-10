@@ -328,7 +328,7 @@ where
     /// Get current statistics
     pub fn stats(&self) -> RateLimiterStats {
         RateLimiterStats {
-            active_entries: self.map.len(),
+            active_entries: self.entries.load(Ordering::Relaxed),
             capacity: self.config.capacity,
             window: self.config.window,
         }
@@ -352,6 +352,8 @@ pub struct RateLimitResult {
 #[derive(Debug, Clone)]
 pub struct RateLimiterStats {
     /// Number of per-key buckets (the shared overflow bucket is not included).
+    /// Read from a counter without locking the map, so it may be briefly off
+    /// while inserts or a cleanup are in flight.
     pub active_entries: usize,
     pub capacity: usize,
     pub window: u64,
