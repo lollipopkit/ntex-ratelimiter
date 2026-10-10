@@ -17,6 +17,7 @@ smol = ["dep:smol"]
 
 [dependencies]
 dashmap = "6"
+ipnet = "2"
 itoa = "1"
 ntex = "3"
 tokio = { version = "1", features = [

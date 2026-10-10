@@ -9,7 +9,7 @@
 //! - **Token Bucket Algorithm**: Efficiently manages request rates.
 //! - **IP-based Rate Limiting**: Identifies clients by IP address.
 //! - **Custom Keys**: `RateLimiter<K>` works with any `Hash + Eq + Clone` key, either in a handler or via [`RateLimit::with_key`].
-//! - **Spoofing-Resistant**: Defaults to the unspoofable peer socket address; `X-Forwarded-For` / `X-Real-IP` are opt-in via `trust_proxy_headers`.
+//! - **Spoofing-Resistant**: Defaults to the unspoofable peer socket address; `X-Forwarded-For` is only read from `trusted_proxies`, taking the rightmost untrusted hop.
 //! - **Bounded Memory**: A `max_entries` cap routes excess unseen keys to a shared overflow bucket, so rotating-IP attacks cannot exhaust memory.
 //! - **Configurable**: Capacity, time window, cleanup interval, proxy-header trust, and max entries.
 //! - **Asynchronous Cleanup**: Periodically removes buckets that have refilled to capacity (lossless) to save memory.
@@ -120,6 +120,7 @@
 
 mod limiter;
 
+pub use ipnet::IpNet;
 pub use limiter::{
     KeyExtractor, PeerIp, RateLimit, RateLimitResult, RateLimiter, RateLimiterConfig,
     RateLimiterStats,

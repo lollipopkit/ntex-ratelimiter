@@ -99,7 +99,7 @@ let config = RateLimiterConfig {
     capacity: 1000,                              // 1000 requests  
     window: 3600,                               // per hour (3600 seconds)
     cleanup_interval: Duration::from_secs(300), // reclaim refilled buckets every 5 minutes
-    trust_proxy_headers: true,                  // trust XFF/X-Real-IP (only behind a trusted proxy)
+    trusted_proxies: vec!["10.0.0.0/8".parse().unwrap()], // read XFF only from these peers
     max_entries: 100_000,                       // cap tracked keys; overflow shares a bucket
 };
 
@@ -121,15 +121,15 @@ This middleware uses the **token bucket algorithm** for rate limiting:
 
 ### Client IP Detection
 
-By default the middleware uses only the **peer socket address** — zero-allocation and not spoofable by the client. Set `trust_proxy_headers = true` in `RateLimiterConfig` to also honor proxy headers; do this **only** behind a trusted proxy that overwrites (not appends to) them, since clients can otherwise forge these headers to bypass limiting:
+By default the middleware uses only the **peer socket address**, which the client cannot spoof.
 
-1. `X-Forwarded-For` header (first IP, only when `trust_proxy_headers = true`)
-1. `X-Real-IP` header (only when `trust_proxy_headers = true`)
-1. Peer socket address (default and fallback)
+Behind a reverse proxy or load balancer, list its networks in `RateLimiterConfig::trusted_proxies` (`IpNet`, re-exported by this crate). When the peer is in one of them, the client IP is the **rightmost** `X-Forwarded-For` hop that is not itself a trusted proxy. Values a client prepends to the header are therefore ignored, which works with proxies that append to the header (e.g. nginx `$proxy_add_x_forwarded_for`). Multiple `X-Forwarded-For` header lines are read as one list, and hops may carry a port (`1.2.3.4:80`, `[::1]:80`). If that hop is malformed or the header is absent, the peer address is used. `X-Real-IP` is not used.
 
-If no IP can be determined (no peer address, e.g. a Unix socket listener without trusted proxy headers), the request is charged to the shared overflow bucket rather than to a fixed address such as `127.0.0.1`.
+IPv4-mapped IPv6 addresses (`::ffff:1.2.3.4`) are normalized to IPv4.
 
-> ⚠️ **Behind a reverse proxy / load balancer**, leaving `trust_proxy_headers = false` means the peer address is the *proxy's* for every request, so all clients share a single bucket and are throttled together. Set `trust_proxy_headers = true` in that deployment (the proxy must overwrite the headers).
+Requests without a peer address (e.g. on a Unix socket listener) are charged to the shared overflow bucket rather than to a fixed address such as `127.0.0.1`, because their proxy cannot be verified. To trust a proxy on a Unix socket, parse its header in `RateLimit::with_key`.
+
+> ⚠️ **Behind a reverse proxy / load balancer**, leaving `trusted_proxies` empty means the peer address is the *proxy's* for every request, so all clients share a single bucket and are throttled together.
 
 ### Memory Safety
 

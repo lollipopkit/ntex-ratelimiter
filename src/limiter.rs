@@ -1,10 +1,12 @@
 use dashmap::DashMap;
 use itoa::Buffer as ItoaBuffer;
+use ipnet::IpNet;
 use ntex::http::header::{HeaderName, HeaderValue};
+use ntex::http::HeaderMap;
 use ntex::service::cfg::SharedCfg;
 use ntex::{http::StatusCode, Middleware, ServiceCtx};
 use std::hash::Hash;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -103,18 +105,19 @@ pub struct RateLimiterConfig {
     /// A bucket idle for `window` seconds is always full, so memory is held
     /// for at most about `window + cleanup_interval` after a key goes quiet.
     pub cleanup_interval: Duration,
-    /// Whether to trust client-provided `X-Forwarded-For` / `X-Real-IP`
-    /// headers. Defaults to `false`: only the direct peer socket address is
-    /// used, which a client cannot spoof. Enable only behind a trusted proxy
-    /// that overwrites (not appends to) these headers.
+    /// Networks of reverse proxies whose `X-Forwarded-For` header is trusted.
     ///
-    /// Note the flip side of the secure default: when the app runs behind a
-    /// reverse proxy or load balancer and this stays `false`, the peer address
-    /// is the *proxy's* for every request, so all clients share one bucket and
-    /// are throttled together. Set this to `true` in that deployment.
+    /// Empty by default: only the peer socket address is used, which a client
+    /// cannot spoof. When the peer is in one of these networks, the client IP
+    /// is the rightmost `X-Forwarded-For` hop that is not itself a trusted
+    /// proxy, so values a client prepends are ignored. If that hop is
+    /// malformed, or the header is absent, the peer address is used.
+    ///
+    /// Behind a reverse proxy or load balancer, leaving this empty means every
+    /// request carries the *proxy's* address, so all clients share one bucket.
     ///
     /// Only consulted by the IP-keyed [`RateLimit`] middleware.
-    pub trust_proxy_headers: bool,
+    pub trusted_proxies: Vec<IpNet>,
     /// Soft cap on the number of per-key buckets. Once the live count reaches
     /// this value, previously unseen keys share a single overflow bucket (still
     /// rate-limited) so that an attacker cannot exhaust memory by rotating
@@ -134,7 +137,7 @@ impl Default for RateLimiterConfig {
             capacity: 100,
             window: 60,
             cleanup_interval: Duration::from_secs(300), // 5 minutes
-            trust_proxy_headers: false,
+            trusted_proxies: Vec::new(),
             max_entries: 100_000,
         }
     }
@@ -372,10 +375,12 @@ pub trait KeyExtractor<K, Err> {
     ) -> Option<RateLimitResult>;
 }
 
-/// Keys requests by client IP (see [`RateLimiterConfig::trust_proxy_headers`]).
+/// Keys requests by client IP (see [`RateLimiterConfig::trusted_proxies`]).
 ///
-/// Requests without a determinable IP (no peer address, e.g. a Unix socket
-/// without trusted proxy headers) share the limiter's overflow bucket.
+/// Requests without a peer address (e.g. on a Unix socket listener) share the
+/// limiter's overflow bucket, since their proxy cannot be verified. To trust
+/// a proxy on a Unix socket, use [`RateLimit::with_key`] and parse its header
+/// there.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PeerIp;
 
@@ -386,7 +391,11 @@ impl<Err> KeyExtractor<IpAddr, Err> for PeerIp {
         limiter: &RateLimiter<IpAddr>,
     ) -> Option<RateLimitResult> {
         Some(
-            match extract_client_ip(req, limiter.config.trust_proxy_headers) {
+            match client_ip(
+                req.peer_addr().map(|addr| addr.ip()),
+                req.headers(),
+                &limiter.config.trusted_proxies,
+            ) {
                 Some(ip) => limiter.check_rate_limit(&ip),
                 None => limiter.check_overflow(),
             },
@@ -509,49 +518,55 @@ where
     }
 }
 
-/// Extract client IP from request, considering proxy headers when trusted.
+/// Resolve the client IP from the peer address and, when the peer is a
+/// trusted proxy, the `X-Forwarded-For` header.
 ///
-/// When `trust_proxy_headers` is `false` (the default), proxy headers are
-/// ignored entirely and the peer socket address is used, since clients can
-/// forge `X-Forwarded-For` / `X-Real-IP` to bypass rate limiting.
-///
-/// Returns `None` when no IP can be determined. Callers must not substitute a
-/// fixed address (e.g. `127.0.0.1`), which would merge these requests with
-/// genuine requests from that address.
-fn extract_client_ip<Err>(req: &web::WebRequest<Err>, trust_proxy_headers: bool) -> Option<IpAddr> {
-    if trust_proxy_headers {
-        // Check X-Forwarded-For header first
-        if let Some(forwarded) = req.headers().get("x-forwarded-for") {
-            if let Ok(forwarded_str) = forwarded.to_str() {
-                if let Some(ip) = forwarded_str.split(',').next() {
-                    let ip = ip.trim();
-                    if let Ok(parsed_ip) = ip.parse::<IpAddr>() {
-                        // `0.0.0.0` / `::` is never a valid client source.
-                        if !parsed_ip.is_unspecified() {
-                            return Some(parsed_ip);
-                        }
-                    }
-                }
-            }
-        }
+/// Returns `None` without a peer address. Callers must not substitute a fixed
+/// address (e.g. `127.0.0.1`), which would merge these requests with genuine
+/// requests from that address.
+fn client_ip(peer: Option<IpAddr>, headers: &HeaderMap, trusted_proxies: &[IpNet]) -> Option<IpAddr> {
+    let peer = peer?.to_canonical();
+    let is_trusted = |ip: &IpAddr| trusted_proxies.iter().any(|net| net.contains(ip));
+    if !is_trusted(&peer) {
+        return Some(peer);
+    }
+    Some(forwarded_for(headers, is_trusted).unwrap_or(peer))
+}
 
-        // Check X-Real-IP header
-        if let Some(real_ip) = req.headers().get("x-real-ip") {
-            if let Ok(ip_str) = real_ip.to_str() {
-                let ip = ip_str.trim();
-                if let Ok(parsed_ip) = ip.parse::<IpAddr>() {
-                    if !parsed_ip.is_unspecified() {
-                        return Some(parsed_ip);
-                    }
-                }
+/// The rightmost `X-Forwarded-For` hop that is not a trusted proxy (the hop
+/// our nearest untrusted neighbour connected from), or the leftmost hop if all
+/// are trusted. `None` if that hop is malformed or the header is absent.
+///
+/// Scans forward over all header lines in order, so no allocation is needed.
+fn forwarded_for(headers: &HeaderMap, is_trusted: impl Fn(&IpAddr) -> bool) -> Option<IpAddr> {
+    // `Some(None)` marks a malformed hop.
+    let mut leftmost: Option<Option<IpAddr>> = None;
+    let mut untrusted: Option<Option<IpAddr>> = None;
+    for value in headers.get_all("x-forwarded-for") {
+        let Ok(value) = value.to_str() else {
+            untrusted = Some(None);
+            continue;
+        };
+        for hop in value.split(',') {
+            let hop = parse_hop(hop.trim());
+            leftmost.get_or_insert(hop);
+            if !hop.is_some_and(|ip| is_trusted(&ip)) {
+                untrusted = Some(hop);
             }
         }
     }
+    untrusted.or(leftmost).flatten()
+}
 
-    // Fallback to the actual peer socket address. This is allocation-free
-    // (no string round-trip through `connection_info()`) and cannot be
-    // spoofed by the client.
-    req.peer_addr().map(|peer| peer.ip())
+/// Parse an `X-Forwarded-For` hop, accepting an optional port
+/// (`1.2.3.4:80`, `[::1]:80`). `0.0.0.0` / `::` is never a valid client.
+fn parse_hop(hop: &str) -> Option<IpAddr> {
+    let ip = hop
+        .parse::<IpAddr>()
+        .or_else(|_| hop.parse::<SocketAddr>().map(|addr| addr.ip()))
+        .ok()?
+        .to_canonical();
+    (!ip.is_unspecified()).then_some(ip)
 }
 
 /// Add rate limit headers to response
@@ -1005,39 +1020,56 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_client_ip_trust_proxy() {
-        // Trusted: X-Forwarded-For is honored.
+    fn test_client_ip() {
+        let trusted: Vec<IpNet> = vec!["10.0.0.0/8".parse().unwrap(), "fd00::/8".parse().unwrap()];
+        let proxy = Some(ip("10.0.0.1"));
+        let resolve = |peer, xff: &[&str]| {
+            let req = xff
+                .iter()
+                .fold(TestRequest::default(), |req, v| req.header("x-forwarded-for", *v))
+                .header("x-real-ip", "7.7.7.7")
+                .to_srv_request();
+            client_ip(peer, req.headers(), &trusted)
+        };
+
+        // No peer address: unknown.
+        assert_eq!(resolve(None, &["1.2.3.4"]), None);
+        // Untrusted peer: headers are ignored.
+        assert_eq!(resolve(Some(ip("8.8.8.8")), &["1.2.3.4"]), Some(ip("8.8.8.8")));
+        // Trusted peer without XFF: the proxy itself (X-Real-IP is never used).
+        assert_eq!(resolve(proxy, &[]), proxy);
+        // Client-prepended values are skipped: rightmost untrusted hop wins.
+        assert_eq!(resolve(proxy, &["6.6.6.6, 1.2.3.4"]), Some(ip("1.2.3.4")));
+        assert_eq!(
+            resolve(proxy, &["6.6.6.6, 1.2.3.4, 10.0.0.2"]),
+            Some(ip("1.2.3.4"))
+        );
+        // Multiple header lines are one list, in order.
+        assert_eq!(
+            resolve(proxy, &["6.6.6.6", "1.2.3.4", "10.0.0.2"]),
+            Some(ip("1.2.3.4"))
+        );
+        // All hops trusted: the leftmost one.
+        assert_eq!(resolve(proxy, &["10.0.0.3, 10.0.0.2"]), Some(ip("10.0.0.3")));
+        // Malformed or unspecified rightmost untrusted hop: fall back to peer.
+        assert_eq!(resolve(proxy, &["1.2.3.4, garbage"]), proxy);
+        assert_eq!(resolve(proxy, &["1.2.3.4, 0.0.0.0"]), proxy);
+        assert_eq!(resolve(proxy, &["1.2.3.4,,10.0.0.2"]), proxy);
+        // Ports are accepted.
+        assert_eq!(resolve(proxy, &["1.2.3.4:5678"]), Some(ip("1.2.3.4")));
+        assert_eq!(resolve(proxy, &["[2001:db8::1]:80"]), Some(ip("2001:db8::1")));
+        // IPv4-mapped IPv6 peers and hops are canonicalized.
+        assert_eq!(
+            resolve(Some(ip("::ffff:10.0.0.1")), &["::ffff:1.2.3.4"]),
+            Some(ip("1.2.3.4"))
+        );
+        assert_eq!(resolve(Some(ip("::ffff:8.8.8.8")), &[]), Some(ip("8.8.8.8")));
+        // IPv6 trusted proxy.
+        assert_eq!(resolve(Some(ip("fd00::1")), &["2001:db8::2"]), Some(ip("2001:db8::2")));
+        // No trusted proxies configured: always the peer.
         let req = TestRequest::default()
             .header("x-forwarded-for", "1.2.3.4")
             .to_srv_request();
-        assert_eq!(extract_client_ip(&req, true), Some(ip("1.2.3.4")));
-
-        // Untrusted (default): XFF is ignored; test requests have no peer
-        // address, so no IP can be determined.
-        let req = TestRequest::default()
-            .header("x-forwarded-for", "1.2.3.4")
-            .to_srv_request();
-        assert_eq!(extract_client_ip(&req, false), None);
-
-        // Trusted: X-Real-IP is honored.
-        let req = TestRequest::default()
-            .header("x-real-ip", "5.6.7.8")
-            .to_srv_request();
-        assert_eq!(extract_client_ip(&req, true), Some(ip("5.6.7.8")));
-
-        // Trusted but malformed header -> falls back to peer (none here).
-        let req = TestRequest::default()
-            .header("x-forwarded-for", "not-an-ip")
-            .to_srv_request();
-        assert_eq!(extract_client_ip(&req, true), None);
-
-        // Trusted but unspecified (`0.0.0.0`) header -> rejected.
-        let req = TestRequest::default()
-            .header("x-forwarded-for", "0.0.0.0")
-            .to_srv_request();
-        assert_eq!(extract_client_ip(&req, true), None);
-
-        // `TestRequest::peer_addr` does not reach `WebRequest::peer_addr` in
-        // ntex 3, so the peer-address path cannot be exercised here.
+        assert_eq!(client_ip(proxy, req.headers(), &[]), proxy);
     }
 }
