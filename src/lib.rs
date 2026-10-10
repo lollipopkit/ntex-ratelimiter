@@ -2,17 +2,18 @@
 //!
 //! `ntex-ratelimiter` is a rate limiting middleware for the `ntex` web framework.
 //! It uses the token bucket algorithm to limit the number of requests from clients
-//! based on their IP address.
+//! based on their IP address, or on any custom key (e.g. an API token id).
 //!
 //! ## Features
 //!
 //! - **Token Bucket Algorithm**: Efficiently manages request rates.
 //! - **IP-based Rate Limiting**: Identifies clients by IP address.
+//! - **Custom Keys**: `RateLimiter<K>` works with any `Hash + Eq + Clone` key, either in a handler or via [`RateLimit::with_key`].
 //! - **Spoofing-Resistant**: Defaults to the unspoofable peer socket address; `X-Forwarded-For` / `X-Real-IP` are opt-in via `trust_proxy_headers`.
-//! - **Bounded Memory**: A `max_entries` cap routes excess unseen clients to a shared overflow bucket, so rotating-IP attacks cannot exhaust memory.
+//! - **Bounded Memory**: A `max_entries` cap routes excess unseen keys to a shared overflow bucket, so rotating-IP attacks cannot exhaust memory.
 //! - **Configurable**: Capacity, time window, cleanup interval, proxy-header trust, and max entries.
 //! - **Asynchronous Cleanup**: Periodically removes stale rate limit entries to save memory.
-//! - **Response Headers**: Adds `X-RateLimit-Remaining`, `X-RateLimit-Limit`, and `X-RateLimit-Reset` headers to responses.
+//! - **Response Headers**: Adds `X-RateLimit-Remaining`, `X-RateLimit-Limit`, and `X-RateLimit-Reset` headers to responses, plus `Retry-After` on 429.
 //! - **Customizable Error Response**: Returns a `429 Too Many Requests` JSON response when limits are exceeded.
 //! - **Runtime Agnostic**: Supports both `tokio` (default) and `smol` runtimes via feature flags.
 //!
@@ -22,7 +23,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! ntex-ratelimiter = "^0.3.0"
+//! ntex-ratelimiter = "^0.4.0"
 //! ```
 //!
 //! ## Feature Flags
@@ -34,7 +35,7 @@
 //! Example with `smol` and `json`:
 //! ```toml
 //! [dependencies]
-//! ntex-ratelimiter = { version = "^0.3.0", default-features = false, features = ["smol", "json"] }
+//! ntex-ratelimiter = { version = "^0.4.0", default-features = false, features = ["smol", "json"] }
 //! ```
 //!
 //! ## Quick Start
@@ -60,6 +61,56 @@
 //! }
 //! ```
 //!
+//! ## Custom Keys
+//!
+//! To limit by something other than the client IP (e.g. an API token), use a
+//! `RateLimiter<K>` and check it in the handler after authentication:
+//!
+//! ```rust,no_run
+//! use ntex::web::{self, HttpRequest, HttpResponse};
+//! use ntex_ratelimiter::RateLimiter;
+//! use std::sync::Arc;
+//!
+//! fn authenticate(req: &HttpRequest) -> Option<String> {
+//!     // Validate the credential and return a stable token id.
+//!     # let _ = req; None
+//! }
+//!
+//! async fn mcp(
+//!     req: HttpRequest,
+//!     limiter: web::types::State<Arc<RateLimiter<String>>>,
+//! ) -> HttpResponse {
+//!     let Some(token_id) = authenticate(&req) else {
+//!         return HttpResponse::Unauthorized().finish();
+//!     };
+//!     let result = limiter.check_rate_limit(&token_id);
+//!     if !result.allowed {
+//!         return HttpResponse::TooManyRequests()
+//!             .header("retry-after", result.retry_after.to_string())
+//!             .finish();
+//!     }
+//!     HttpResponse::Ok().body("ok")
+//! }
+//!
+//! #[ntex::main]
+//! async fn main() -> std::io::Result<()> {
+//!     // 60 requests per minute per token
+//!     let limiter = RateLimiter::<String>::new(60, 60);
+//!
+//!     web::HttpServer::new(async move || {
+//!         web::App::new()
+//!             .state(limiter.clone())
+//!             .service(web::resource("/mcp").route(web::post().to(mcp)))
+//!     })
+//!     .bind("127.0.0.1:8080")?
+//!     .run()
+//!     .await
+//! }
+//! ```
+//!
+//! [`RateLimit::with_key`] does the same as middleware; see its docs for the
+//! caveat about keying on unverified credentials.
+//!
 //! For more advanced usage and configuration, please refer to the documentation of
 //! [`RateLimiter`] and [`RateLimiterConfig`].
 //!
@@ -70,7 +121,10 @@
 
 mod limiter;
 
-pub use limiter::{RateLimit, RateLimitResult, RateLimiter, RateLimiterConfig, RateLimiterStats};
+pub use limiter::{
+    KeyExtractor, PeerIp, RateLimit, RateLimitResult, RateLimiter, RateLimiterConfig,
+    RateLimiterStats,
+};
 
 // Prevent conflicting runtime features
 #[cfg(all(feature = "tokio", feature = "smol"))]
