@@ -11,17 +11,14 @@ keywords = ["ntex", "rate-limiter", "middleware", "token-bucket"]
 categories = ["web-programming", "network-programming"]
 
 [features]
-default = ["tokio", "json"]
+default = ["tokio"]
 tokio = ["dep:tokio"]
 smol = ["dep:smol"]
-json = ["dep:serde", "dep:serde_json"]
 
 [dependencies]
 dashmap = "6"
 itoa = "1"
 ntex = "3"
-serde = { version = "1.0", features = ["derive"], optional = true }
-serde_json = { version = "1.0", optional = true }
 tokio = { version = "1", features = [
     "sync",
     "time",

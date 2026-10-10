@@ -10,18 +10,14 @@ A rate limiting middleware for the [ntex](https://github.com/ntex-rs/ntex) web f
 
 - `tokio` (default): Enable Tokio runtime support
 - `smol`: Enable smol runtime support (smol is the maintained successor of async-std)
-- `json` (default): Enable JSON serialization for error responses
 
 ```toml
 [dependencies]
-# Default features (tokio + json)
+# Default features (tokio)
 ntex-ratelimiter = "^0.4"
 
 # With smol instead of tokio
-ntex-ratelimiter = { version = "^0.4", default-features = false, features = ["smol", "json"] }
-
-# Minimal build without JSON support
-ntex-ratelimiter = { version = "^0.4", default-features = false, features = ["tokio"] }
+ntex-ratelimiter = { version = "^0.4", default-features = false, features = ["smol"] }
 ```
 
 ## Usage

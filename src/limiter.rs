@@ -17,9 +17,6 @@ use tokio::time::interval;
 #[cfg(feature = "smol")]
 use smol::Timer;
 
-#[cfg(feature = "json")]
-use serde::{Deserialize, Serialize};
-
 const HEADER_RATELIMIT_REMAINING: &str = "x-ratelimit-remaining";
 const HEADER_RATELIMIT_LIMIT: &str = "x-ratelimit-limit";
 const HEADER_RATELIMIT_RESET: &str = "x-ratelimit-reset";
@@ -495,7 +492,7 @@ where
         };
 
         if !result.allowed {
-            return Err(RateLimitError::from(result).into());
+            return Err(RateLimitError(result).into());
         }
 
         let mut response = ctx.call(&self.service, req).await?;
@@ -569,83 +566,36 @@ fn add_rate_limit_headers(headers: &mut ntex::http::HeaderMap, result: &RateLimi
     }
 }
 
-/// Rate limit error response
+/// Error returned by the middleware when a request is rate-limited.
 #[derive(Debug)]
-#[cfg_attr(feature = "json", derive(Serialize, Deserialize))]
-struct RateLimitErrorData {
-    remaining: u32,
-    reset: u64,
-    limit: usize,
-}
-
-/// Wrapper struct used only when serializing the JSON error body.
-#[cfg(feature = "json")]
-#[derive(Debug, Serialize, Deserialize)]
-struct RateLimitErrorResponse {
-    code: u32,
-    message: String,
-    data: RateLimitErrorData,
-}
-
-#[derive(Debug)]
-struct RateLimitError {
-    data: RateLimitErrorData,
-    retry_after: u64,
-}
-
-impl From<RateLimitResult> for RateLimitError {
-    fn from(result: RateLimitResult) -> Self {
-        Self {
-            data: RateLimitErrorData {
-                remaining: result.remaining,
-                reset: result.reset,
-                limit: result.limit,
-            },
-            retry_after: result.retry_after,
-        }
-    }
-}
+struct RateLimitError(RateLimitResult);
 
 impl std::fmt::Display for RateLimitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
             "Rate limit exceeded. Remaining: {}, Reset: {}, Limit: {}",
-            self.data.remaining, self.data.reset, self.data.limit
+            self.0.remaining, self.0.reset, self.0.limit
         )
     }
 }
 
 impl web::error::WebResponseError for RateLimitError {
     fn error_response(&self, _: &ntex::web::HttpRequest) -> web::HttpResponse {
-        #[cfg(feature = "json")]
-        let body = {
-            let error_response = RateLimitErrorResponse {
-                code: 429,
-                message: "Rate limit exceeded".to_string(),
-                data: RateLimitErrorData {
-                    remaining: self.data.remaining,
-                    reset: self.data.reset,
-                    limit: self.data.limit,
-                },
-            };
-            serde_json::to_string(&error_response)
-                .unwrap_or_else(|_| r#"{"code":429,"message":"Rate limit exceeded"}"#.to_string())
-        };
-
-        #[cfg(not(feature = "json"))]
+        let r = &self.0;
+        // Only integers are interpolated, so no JSON escaping is needed.
         let body = format!(
             r#"{{"code":429,"message":"Rate limit exceeded","data":{{"remaining":{},"reset":{},"limit":{}}}}}"#,
-            self.data.remaining, self.data.reset, self.data.limit
+            r.remaining, r.reset, r.limit
         );
 
         let mut buf = ItoaBuffer::new();
         web::HttpResponse::build(StatusCode::TOO_MANY_REQUESTS)
             .set_header("content-type", "application/json")
-            .set_header(HEADER_RATELIMIT_REMAINING, buf.format(self.data.remaining))
-            .set_header(HEADER_RATELIMIT_LIMIT, buf.format(self.data.limit))
-            .set_header(HEADER_RATELIMIT_RESET, buf.format(self.data.reset))
-            .set_header(HEADER_RETRY_AFTER, buf.format(self.retry_after))
+            .set_header(HEADER_RATELIMIT_REMAINING, buf.format(r.remaining))
+            .set_header(HEADER_RATELIMIT_LIMIT, buf.format(r.limit))
+            .set_header(HEADER_RATELIMIT_RESET, buf.format(r.reset))
+            .set_header(HEADER_RETRY_AFTER, buf.format(r.retry_after))
             .body(body)
     }
 }
@@ -976,6 +926,37 @@ mod tests {
             let req = TestRequest::default().to_srv_request();
             assert!(mw.key.check_request(&req, &limiter).is_none());
         });
+    }
+
+    #[test]
+    fn test_error_response() {
+        use ntex::web::error::WebResponseError;
+
+        let err = RateLimitError(RateLimitResult {
+            allowed: false,
+            remaining: 0,
+            reset: 1_700_000_000,
+            retry_after: 3,
+            limit: 100,
+        });
+        let res = err.error_response(&TestRequest::default().to_http_request());
+        assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let header = |name| res.headers().get(name).unwrap().to_str().unwrap();
+        assert_eq!(header(HEADER_RETRY_AFTER), "3");
+        assert_eq!(header(HEADER_RATELIMIT_REMAINING), "0");
+        assert_eq!(header(HEADER_RATELIMIT_LIMIT), "100");
+        assert_eq!(header(HEADER_RATELIMIT_RESET), "1700000000");
+        assert_eq!(header("content-type"), "application/json");
+
+        let body = match res.body() {
+            ntex::http::body::ResponseBody::Body(ntex::http::body::Body::Bytes(b)) => b.clone(),
+            other => panic!("unexpected body: {other:?}"),
+        };
+        assert_eq!(
+            &body[..],
+            br#"{"code":429,"message":"Rate limit exceeded","data":{"remaining":0,"reset":1700000000,"limit":100}}"#
+        );
     }
 
     #[test]

@@ -861,8 +861,6 @@ dependencies = [
  "dashmap",
  "itoa",
  "ntex",
- "serde",
- "serde_json",
  "smol",
  "tokio",
 ]

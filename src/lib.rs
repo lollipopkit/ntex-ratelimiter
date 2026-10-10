@@ -30,12 +30,11 @@
 //!
 //! - `tokio` (default): Enables Tokio runtime support.
 //! - `smol`: Enables smol runtime support (smol is the maintained successor of async-std).
-//! - `json` (default): Enables JSON serialization for error responses using `serde`.
 //!
-//! Example with `smol` and `json`:
+//! Example with `smol`:
 //! ```toml
 //! [dependencies]
-//! ntex-ratelimiter = { version = "^0.4.0", default-features = false, features = ["smol", "json"] }
+//! ntex-ratelimiter = { version = "^0.4.0", default-features = false, features = ["smol"] }
 //! ```
 //!
 //! ## Quick Start
