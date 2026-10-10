@@ -78,7 +78,8 @@ fn compute_reset_time(tokens: f64, config: &RateLimiterConfig) -> u64 {
     let refill_rate = config.capacity as f64 / config.window as f64;
     let seconds_to_refill = missing_tokens / refill_rate;
 
-    now_secs + seconds_to_refill.ceil() as u64
+    // The float-to-int cast saturates, so a huge `window` cannot wrap here.
+    now_secs.saturating_add(seconds_to_refill.ceil() as u64)
 }
 
 /// `Duration` as nanoseconds, saturating (u64 nanoseconds cover ~584 years).
@@ -1049,6 +1050,16 @@ mod tests {
             ipv6_prefix_len: 129,
             ..Default::default()
         });
+    }
+
+    #[test]
+    fn test_huge_window_does_not_overflow() {
+        let limiter = RateLimiter::<u32>::new(1, u64::MAX);
+        assert!(limiter.check_rate_limit(&1).allowed);
+        let result = limiter.check_rate_limit(&1);
+        assert!(!result.allowed);
+        assert_eq!(result.reset, u64::MAX);
+        assert_eq!(result.retry_after, u64::MAX);
     }
 
     #[test]

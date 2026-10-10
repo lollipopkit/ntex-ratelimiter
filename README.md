@@ -135,7 +135,7 @@ Buckets that have refilled to full capacity hold no state and are reclaimed ever
 
 ## Response Headers
 
-The middleware adds these headers to all rate-limited responses:
+The middleware adds these headers to the response of every request it checks, whether the request is allowed or rejected with 429 (requests for which a `with_key` key function returns `None` are not checked):
 
 |Header                 |Description                                   |
 |-----------------------|----------------------------------------------|
